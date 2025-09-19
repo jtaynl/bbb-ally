@@ -26,25 +26,19 @@ if (!BBB_API_BASE || !BBB_SECRET || !PUBLIC_BASE_URL || !DASHSCOPE_API_KEY || !A
 
 const app = express();
 
-// Capture raw body for accurate signature verification
-const rawSaver = (req, res, buf) => {
-  req.rawBody = buf ? buf.toString("utf8") : "";
-};
+// Keep raw body for signature verification
+const rawSaver = (req, res, buf) => { req.rawBody = buf ? buf.toString("utf8") : ""; };
 app.use(bodyParser.urlencoded({ extended: false, verify: rawSaver }));
 app.use(bodyParser.json({ verify: rawSaver }));
 
 const redis = new Redis(REDIS_URL);
 const xml = new XMLParser({ ignoreAttributes: false });
 
-function urlEncodeParams(params) {
-  return new URLSearchParams(params).toString();
+/* ---------- BBB helpers ---------- */
+function urlEncodeParams(params) { return new URLSearchParams(params).toString(); }
+function bbbChecksum(callName, qsNoChecksum) {
+  return crypto.createHash("sha1").update(callName + qsNoChecksum + BBB_SECRET).digest("hex");
 }
-
-function bbbChecksum(callName, queryStringNoChecksum) {
-  // BBB API checksum = sha1(callName + queryString + secret)
-  return crypto.createHash("sha1").update(callName + queryStringNoChecksum + BBB_SECRET).digest("hex");
-}
-
 async function bbbGet(callName, params = {}) {
   const qs = urlEncodeParams(params);
   const checksum = bbbChecksum(callName, qs);
@@ -52,8 +46,6 @@ async function bbbGet(callName, params = {}) {
   const res = await axios.get(url, { timeout: 10000 });
   return xml.parse(res.data);
 }
-
-// Robust chat sender: try external meeting ID, then internal as fallback
 async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
   const MAX = 500;
   const chunks = [];
@@ -70,67 +62,60 @@ async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
   }
 
   try {
-    if (extMeetingId) {
-      await sendWith(extMeetingId);
-      return true;
-    }
+    if (extMeetingId) { await sendWith(extMeetingId); return true; }
   } catch (e) {
     console.warn("sendChat (external) failed:", e?.response?.status || e.message);
   }
   if (intMeetingId) {
-    try {
-      await sendWith(intMeetingId);
-      return true;
-    } catch (e) {
-      console.warn("sendChat (internal) failed:", e?.response?.status || e.message);
-    }
+    try { await sendWith(intMeetingId); return true; }
+    catch (e) { console.warn("sendChat (internal) failed:", e?.response?.status || e.message); }
   }
   return false;
 }
 
+/* ---------- Signature ---------- */
 function constantTimeEquals(a, b) {
-  try {
-    return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
-  } catch {
-    return false;
-  }
+  try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); }
+  catch { return false; }
 }
-
 function verifyWebhookSignature(req) {
   const strict = String(WEBHOOK_STRICT).toLowerCase() === "true";
   const received = req.query.checksum || "";
-  if (!received) return !strict; // allow if not strict
+  if (!received) return !strict;
 
   const cb = `${PUBLIC_BASE_URL}${req.path}`;
-  const bodies = [];
-
-  // 1) raw body
-  if (req.rawBody) bodies.push(req.rawBody);
-  // 2) urlencoded re-encoding
-  try {
-    const enc = new URLSearchParams(req.body).toString();
-    if (enc) bodies.push(enc);
-  } catch {}
-  // 3) newline-joined key=value
+  const candidates = [];
+  if (req.rawBody) candidates.push(req.rawBody);
+  try { const enc = new URLSearchParams(req.body).toString(); if (enc) candidates.push(enc); } catch {}
   try {
     const nl = Object.entries(req.body)
       .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
       .join("\n");
-    if (nl) bodies.push(nl);
+    if (nl) candidates.push(nl);
   } catch {}
 
   const algs = [WEBHOOK_CHECKSUM_ALG, "sha1", "sha256", "sha384", "sha512"];
-  for (const bodyStr of bodies) {
+  for (const bodyStr of candidates) {
     for (const alg of algs) {
       const h = crypto.createHash(alg).update(cb + bodyStr + BBB_SECRET).digest("hex");
       if (constantTimeEquals(h, received)) return true;
     }
   }
-  return !strict; // if not strict, allow; else reject
+  return !strict;
 }
 
-/* ------------ event parsing helpers ------------- */
-
+/* ---------- Event parsing ---------- */
+function normalizeWebhookEvents(req) {
+  let body = req.body;
+  if (typeof body === "string") { try { body = JSON.parse(body); } catch { return []; } }
+  if (body && body.event) {
+    const ev = typeof body.event === "string" ? JSON.parse(body.event) : body.event;
+    return [ev];
+  }
+  if (Array.isArray(body)) return body.map(ev => (typeof ev === "string" ? JSON.parse(ev) : ev));
+  if (body && body.data) return [body];
+  return [];
+}
 function looksLikeChatEvent(ev) {
   const id = ev?.data?.id?.toLowerCase?.() || "";
   const attrs = ev?.data?.attributes || {};
@@ -138,120 +123,81 @@ function looksLikeChatEvent(ev) {
   if (attrs?.message || attrs?.chat || attrs?.["message-id"]) return true;
   return false;
 }
-
 function extractMessage(ev) {
   const a = ev?.data?.attributes || {};
   return (a?.message?.message || a?.message || a?.content || "").toString();
 }
-
 function extractMeetingIds(ev) {
   const a = ev?.data?.attributes || {};
   const ext =
     (a?.meeting && (a.meeting["external-meeting-id"] || a.meeting.externalMeetingID)) ||
-    a["external-meeting-id"] ||
-    a.externalMeetingID ||
-    a.meeting_id ||
-    a.meetingId ||
-    "";
+    a["external-meeting-id"] || a.externalMeetingID || a.meeting_id || a.meetingId || "";
   const intr =
     (a?.meeting && (a.meeting["internal-meeting-id"] || a.meeting.internalMeetingID)) ||
-    a["internal-meeting-id"] ||
-    a.internalMeetingID ||
-    "";
+    a["internal-meeting-id"] || a.internalMeetingID || "";
   return { extMeetingId: String(ext || ""), intMeetingId: String(intr || "") };
 }
-
 function extractUser(ev) {
   const a = ev?.data?.attributes || {};
   const s = a?.sender || a?.user || {};
   return {
-    internalUserId:
-      String(
-        s?.["internal-user-id"] ||
-          s?.internalUserId ||
-          s?.id ||
-          a?.["user-id"] ||
-          a?.userId ||
-          ""
-      ),
+    internalUserId: String(
+      s?.["internal-user-id"] || s?.internalUserId || s?.id || a?.["user-id"] || a?.userId || ""
+    ),
     name: String(s?.["user-name"] || s?.name || a?.["user-name"] || a?.fullName || ""),
     role: String(s?.role || (a?.message?.sender && a.message.sender.role) || "").toUpperCase(),
   };
 }
 
-// Normalize BBB webhook body to an array of events
-function normalizeWebhookEvents(req) {
-  let body = req.body;
-
-  // If BBB sent a JSON string
-  if (typeof body === "string") {
-    try {
-      body = JSON.parse(body);
-    } catch {
-      return [];
-    }
-  }
-
-  // If BBB sent { event: "<json-string>" } or { event: { ... } }
-  if (body && body.event) {
-    const ev = typeof body.event === "string" ? JSON.parse(body.event) : body.event;
-    return [ev];
-  }
-
-  // If BBB sent an array of events (what your logs show)
-  if (Array.isArray(body)) {
-    return body.map((ev) => (typeof ev === "string" ? JSON.parse(ev) : ev));
-  }
-
-  // If BBB sent a single event object
-  if (body && body.data) return [body];
-
-  return [];
+/* ---------- Trigger handling (tolerant) ---------- */
+function extractQuestion(text, trigger = ALLY_TRIGGER) {
+  if (!text) return null;
+  const norm = text.replace(/\s+/g, " ").trim(); // collapse spaces
+  // Build a regex that matches the trigger at start or after leading space,
+  // allows optional punctuation, then captures the rest as the question.
+  const esc = trigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`^(?:\\s*)${esc}\\s*[:,-]?\\s*(.*)$`, "i");
+  const m = norm.match(re);
+  if (m) return m[1] || ""; // may be empty if user typed only the trigger
+  return null;
 }
 
-/* --------------- model call ----------------- */
-
+/* ---------- Model call ---------- */
 async function callQwen(meetingID, userKey, prompt) {
   const redisKey = `ally:sess:${meetingID}:${userKey}`;
   const sessionId = (await redis.get(redisKey)) || null;
 
   const url = `https://dashscope-intl.aliyuncs.com/api/v1/apps/${APP_ID}/completion`;
-  const payload = {
-    input: { prompt },
-    ...(sessionId ? { session_id: sessionId } : {}),
-    parameters: {},
-  };
+  const payload = { input: { prompt }, ...(sessionId ? { session_id: sessionId } : {}), parameters: {} };
 
   const res = await axios.post(url, payload, {
-    headers: {
-      Authorization: `Bearer ${DASHSCOPE_API_KEY}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${DASHSCOPE_API_KEY}`, "Content-Type": "application/json" },
     timeout: 20000,
   });
 
   const out = res.data?.output || {};
-  if (out.session_id) {
-    await redis.set(redisKey, out.session_id, "EX", 60 * 60 * 24);
-  }
+  if (out.session_id) await redis.set(redisKey, out.session_id, "EX", 60 * 60 * 24);
   return out.text || "(no answer)";
 }
 
-/* --------------- routes ----------------- */
-
+/* ---------- Routes ---------- */
 app.get("/healthz", (req, res) => res.json({ ok: true }));
 
 app.post("/webhook", async (req, res) => {
   try {
-    if (!verifyWebhookSignature(req)) {
-      return res.status(403).send("bad signature");
-    }
+    if (!verifyWebhookSignature(req)) return res.status(403).send("bad signature");
 
     const events = normalizeWebhookEvents(req);
     console.log("WEBHOOK EVENTS", Array.isArray(events) ? events.length : 0);
     if (!events.length) return res.status(200).send("ok");
 
     for (const ev of events) {
+      // DEBUG: show event id, keys, and extracted text
+      const id = ev?.data?.id;
+      const attrs = ev?.data?.attributes || {};
+      const textPreview = (extractMessage(ev) || "").slice(0, 120);
+      console.log("EV", { id, keys: Object.keys(attrs), text: textPreview });
+
       if (!looksLikeChatEvent(ev)) continue;
 
       const ids = extractMeetingIds(ev);
@@ -259,23 +205,21 @@ app.post("/webhook", async (req, res) => {
       const text = extractMessage(ev);
       if (!text) continue;
 
-      const t = text.trim();
-      if (!t.toLowerCase().startsWith(ALLY_TRIGGER.toLowerCase())) continue;
+      const question = extractQuestion(text);
+      const isMod = user.role ? user.role === "MODERATOR" : true; // allow if role missing
 
-      // Use role from event when available; fallback to allow if missing
-      const isMod = user.role ? user.role === "MODERATOR" : true;
-      console.log("CHAT", {
-        trigger: true,
+      console.log("PARSED", {
+        trigger: question !== null,
         role: user.role || "(unknown)",
         isMod,
         ext: ids.extMeetingId,
         int: ids.intMeetingId,
         user: user.name || user.internalUserId,
-        msg: t.slice(0, 80),
+        q: (question || "").slice(0, 120),
       });
-      if (!isMod) continue;
 
-      const question = t.slice(ALLY_TRIGGER.length).trim();
+      if (question === null) continue;         // trigger not matched
+      if (!isMod) continue;                    // not a moderator
       if (!question) {
         await bbbSendChatRobust(ids, `Usage: ${ALLY_TRIGGER} <your question>`);
         continue;
@@ -298,8 +242,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-/* --------------- startup ----------------- */
-
+/* ---------- Startup ---------- */
 async function registerWebhook() {
   try {
     const callbackURL = `${PUBLIC_BASE_URL}/webhook`;
