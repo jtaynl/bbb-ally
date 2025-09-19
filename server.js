@@ -319,7 +319,14 @@ async function callQwen(meetingID, userKey, prompt) {
   }
 
   const url = `https://dashscope-intl.aliyuncs.com/api/v1/apps/${APP_ID}/completion`;
-  const payload = { input: { prompt: finalPrompt }, ...(sessionId ? { session_id: sessionId } : {}), parameters: {} };
+  // IMPORTANT: session_id must be INSIDE input for multi-turn
+  const payload = {
+    input: {
+      prompt: finalPrompt,
+      ...(sessionId ? { session_id: sessionId } : {}),   // <-- fix for multi-turn
+    },
+    parameters: {}
+  };
 
   const res = await axios.post(url, payload, {
     headers: { Authorization: `Bearer ${DASHSCOPE_API_KEY}`, "Content-Type": "application/json" },
@@ -327,7 +334,10 @@ async function callQwen(meetingID, userKey, prompt) {
   });
 
   const out = res.data?.output || {};
-  if (out.session_id) await redis.set(redisKey, out.session_id, "EX", 60 * 60 * 24);
+  if (out.session_id && out.session_id !== sessionId) {
+    console.log("Qwen returned new session_id:", out.session_id);
+  }
+  if (out.session_id) await redis.set(redisKey, out.session_id, "EX", 60 * 60 * 24); // 24h TTL
   return out.text || "(no answer)";
 }
 
