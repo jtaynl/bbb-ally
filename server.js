@@ -126,7 +126,7 @@ function normalizeFromRaw(raw) {
   if (!raw) return events;
   const s = raw.trim();
 
-  // URL-encoded (default): event=<json or json-array>&timestamp=...
+  // URL-encoded: event=<json or json-array>&timestamp=...
   if (s.includes("event=")) {
     try {
       const params = new URLSearchParams(s);
@@ -233,14 +233,20 @@ function looksLikeChatEvent(ev) {
   const id = ev?.data?.id?.toLowerCase?.() || "";
   const attrs = ev?.data?.attributes || {};
   if (id.includes("chat")) return true;
-  if (attrs?.message || attrs?.chat || attrs?.["message-id"]) return true;
+  if (attrs?.["chat-message"] || attrs?.message || attrs?.chat || attrs?.["message-id"]) return true;
   return false;
 }
 
 function extractMessage(ev) {
   const a = ev?.data?.attributes || {};
-  // message could be a plain string or an object with { message: "...", sender:{...} }
-  return (a?.message?.message || a?.message || a?.content || "").toString();
+  const cm = a?.["chat-message"];
+  if (cm) {
+    if (typeof cm === "string") return cm.toString();
+    const txt = cm.message ?? cm.text ?? cm.content ?? "";
+    return String(txt || "");
+  }
+  // fallbacks for other shapes
+  return String(a?.message?.message || a?.message || a?.content || "");
 }
 
 function extractMeetingIds(ev) {
@@ -256,9 +262,13 @@ function extractMeetingIds(ev) {
 
 function extractUser(ev) {
   const a = ev?.data?.attributes || {};
-  const s = a?.sender || a?.user || {};
+  // Prefer sender from chat-message when available
+  const cm = a?.["chat-message"];
+  const s = (cm && cm.sender) || a?.sender || a?.user || {};
   return {
-    internalUserId: String(s?.["internal-user-id"] || s?.internalUserId || s?.id || a?.["user-id"] || a?.userId || ""),
+    internalUserId: String(
+      s?.["internal-user-id"] || s?.internalUserId || s?.id || a?.["user-id"] || a?.userId || ""
+    ),
     name: String(s?.["user-name"] || s?.name || a?.["user-name"] || a?.fullName || ""),
     role: String(s?.role || (a?.message?.sender && a.message.sender.role) || "").toUpperCase(),
   };
@@ -319,7 +329,8 @@ app.post("/webhook", async (req, res) => {
       if (!text) continue;
 
       const question = extractQuestion(text);
-      const isMod = user.role ? user.role === "MODERATOR" : true; // allow if role missing
+      // If role missing, allow (BBB sometimes omits role in this event)
+      const isMod = user.role ? user.role === "MODERATOR" : true;
 
       console.log("PARSED", {
         trigger: question !== null,
