@@ -8,14 +8,14 @@ import { XMLParser } from "fast-xml-parser";
 const {
   BBB_API_BASE,
   BBB_SECRET,
-  PUBLIC_BASE_URL,
+  PUBLIC_BASE_URL,           // e.g. https://skillsfuture.io/ally
   DASHSCOPE_API_KEY,
   APP_ID,
   ALLY_TRIGGER = "@ask ally",
   ALLY_NAME = "Ally",
   REDIS_URL = "redis://localhost:6379",
-  WEBHOOK_CHECKSUM_ALG = "sha256",
-  WEBHOOK_STRICT = "false",
+  WEBHOOK_CHECKSUM_ALG = "sha256",  // bbb-webhooks default
+  WEBHOOK_STRICT = "true",          // recommended
   PORT = 8080,
 } = process.env;
 
@@ -26,7 +26,7 @@ if (!BBB_API_BASE || !BBB_SECRET || !PUBLIC_BASE_URL || !DASHSCOPE_API_KEY || !A
 
 const app = express();
 
-// keep raw body for checksum + custom parsing
+// Keep raw body for signature verification + custom parsing
 const rawSaver = (req, res, buf) => { req.rawBody = buf ? buf.toString("utf8") : ""; };
 app.use(bodyParser.urlencoded({ extended: false, verify: rawSaver }));
 app.use(bodyParser.json({ verify: rawSaver }));
@@ -34,11 +34,11 @@ app.use(bodyParser.json({ verify: rawSaver }));
 const redis = new Redis(REDIS_URL);
 const xml = new XMLParser({ ignoreAttributes: false });
 
-/* ---------- BBB helpers ---------- */
+/* ---------------- BBB helpers ---------------- */
 function urlEncodeParams(params) { return new URLSearchParams(params).toString(); }
 
 function bbbChecksum(callName, qsNoChecksum) {
-  // API checksum: sha1(callName + queryString + secret)
+  // BBB API: sha1(callName + queryString + secret)
   return crypto.createHash("sha1").update(callName + qsNoChecksum + BBB_SECRET).digest("hex");
 }
 
@@ -50,7 +50,7 @@ async function bbbGet(callName, params = {}) {
   return xml.parse(res.data);
 }
 
-// Robust chat sender: try external meeting ID first, then internal as fallback
+// Send chat: try external meeting ID, then internal
 async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
   const MAX = 500;
   const chunks = [];
@@ -68,17 +68,18 @@ async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
 
   try {
     if (extMeetingId) { await sendWith(extMeetingId); return true; }
-  } catch (e) { console.warn("sendChat (external) failed:", e?.response?.status || e.message); }
-
+  } catch (e) {
+    console.warn("sendChat (external) failed:", e?.response?.status || e.message);
+  }
   if (intMeetingId) {
     try { await sendWith(intMeetingId); return true; }
     catch (e) { console.warn("sendChat (internal) failed:", e?.response?.status || e.message); }
   }
-
   return false;
 }
 
-/* ---------- Signature (sha<alg>(callbackURL + body + secret)) ---------- */
+/* ---------------- Signature verification ---------------- */
+// bbb-webhooks builds checksum over: callbackURL + body + secret (with chosen hash alg)
 function constantTimeEquals(a, b) { try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); } catch { return false; } }
 
 function verifyWebhookSignature(req) {
@@ -89,7 +90,7 @@ function verifyWebhookSignature(req) {
   const cb = `${PUBLIC_BASE_URL}${req.path}`;
   const candidates = [];
 
-  // 1) raw body exactly as received
+  // 1) exact raw body string
   if (req.rawBody) candidates.push(req.rawBody);
 
   // 2) urlencoded re-encoding
@@ -116,32 +117,29 @@ function verifyWebhookSignature(req) {
   return !strict;
 }
 
-/* ---------- Normalization & parsing ---------- */
+/* ---------------- Normalization & parsing ---------------- */
 const safeParse = (v) =>
   (typeof v === "string" ? (() => { try { return JSON.parse(v); } catch { return undefined; } })() : v);
 
-// Handle raw (string) bodies, including URL-encoded `event=[{...}]`
+// Handle raw bodies including URL-encoded `event=[{...}]`
 function normalizeFromRaw(raw) {
   const events = [];
   if (!raw) return events;
   const s = raw.trim();
 
-  // URL-encoded: event=<json or json-array>&timestamp=...
+  // application/x-www-form-urlencoded: event=<json or json-array>&timestamp=...
   if (s.includes("event=")) {
     try {
       const params = new URLSearchParams(s);
-      const evStr = params.get("event");                // may be an array "[{...}, {...}]"
+      const evStr = params.get("event");          // may be an array: "[{...}]"
       const parsed = safeParse(evStr);
-      if (Array.isArray(parsed)) {
-        events.push(...parsed);                          // expand array
-      } else if (parsed) {
-        events.push(parsed);
-      }
+      if (Array.isArray(parsed)) events.push(...parsed);
+      else if (parsed) events.push(parsed);
       return events;
     } catch {}
   }
 
-  // JSON raw
+  // Raw JSON bodies (rare)
   if (s.startsWith("[") || s.startsWith("{")) {
     const parsed = safeParse(s);
     if (!parsed) return events;
@@ -181,7 +179,8 @@ function normalizeWebhookEvents(req) {
   // 1) Parsed object with `event` (may be array or object)
   if (req.body && req.body.event) {
     const parsed = safeParse(req.body.event) ?? req.body.event;
-    if (Array.isArray(parsed)) events.push(...parsed); else if (parsed) events.push(parsed);
+    if (Array.isArray(parsed)) events.push(...parsed);
+    else if (parsed) events.push(parsed);
   }
 
   // 2) Parsed array body
@@ -212,10 +211,10 @@ function normalizeWebhookEvents(req) {
     }
   }
 
-  // 4) Fallback: use raw string body (covers urlencoded `event=[...]`)
+  // 4) Fallback to raw string
   if (!events.length) events = normalizeFromRaw(req.rawBody);
 
-  // 5) Edge: urlencoded parsed into { "<json>": "" }
+  // 5) Edge: urlencoded parsed into a single-key object of JSON text
   if (!events.length && req.body && typeof req.body === "object") {
     const keys = Object.keys(req.body);
     if (keys.length === 1 && (keys[0].startsWith("[") || keys[0].startsWith("{"))) {
@@ -228,7 +227,7 @@ function normalizeWebhookEvents(req) {
   return events;
 }
 
-/* ---------- Event helpers ---------- */
+/* ---------------- Event helpers ---------------- */
 function looksLikeChatEvent(ev) {
   const id = ev?.data?.id?.toLowerCase?.() || "";
   const attrs = ev?.data?.attributes || {};
@@ -237,6 +236,7 @@ function looksLikeChatEvent(ev) {
   return false;
 }
 
+// Extract text from attributes["chat-message"] (observed on your server)
 function extractMessage(ev) {
   const a = ev?.data?.attributes || {};
   const cm = a?.["chat-message"];
@@ -245,7 +245,7 @@ function extractMessage(ev) {
     const txt = cm.message ?? cm.text ?? cm.content ?? "";
     return String(txt || "");
   }
-  // fallbacks for other shapes
+  // fallback for other shapes
   return String(a?.message?.message || a?.message || a?.content || "");
 }
 
@@ -262,7 +262,6 @@ function extractMeetingIds(ev) {
 
 function extractUser(ev) {
   const a = ev?.data?.attributes || {};
-  // Prefer sender from chat-message when available
   const cm = a?.["chat-message"];
   const s = (cm && cm.sender) || a?.sender || a?.user || {};
   return {
@@ -274,7 +273,7 @@ function extractUser(ev) {
   };
 }
 
-/* ---------- Trigger handling (tolerant) ---------- */
+/* ---------------- Trigger handling ---------------- */
 function extractQuestion(text, trigger = ALLY_TRIGGER) {
   if (!text) return null;
   const norm = text.replace(/\s+/g, " ").trim();
@@ -284,7 +283,7 @@ function extractQuestion(text, trigger = ALLY_TRIGGER) {
   return m ? (m[1] ?? "") : null;
 }
 
-/* ---------- Model ---------- */
+/* ---------------- Model call (Alibaba Cloud Model Studio App) ---------------- */
 async function callQwen(meetingID, userKey, prompt) {
   const redisKey = `ally:sess:${meetingID}:${userKey}`;
   const sessionId = (await redis.get(redisKey)) || null;
@@ -302,7 +301,28 @@ async function callQwen(meetingID, userKey, prompt) {
   return out.text || "(no answer)";
 }
 
-/* ---------- Routes ---------- */
+/* ---------------- Moderator-only strict fallback ---------------- */
+async function isModeratorStrict({ extMeetingId, intMeetingId }, user) {
+  const meetingIDs = [extMeetingId, intMeetingId].filter(Boolean);
+  for (const meetingID of meetingIDs) {
+    try {
+      const res = await bbbGet("getMeetingInfo", { meetingID });
+      const node = res?.response?.attendees?.attendee;
+      const attendees = node ? (Array.isArray(node) ? node : [node]) : [];
+      const found = attendees.find(a =>
+        a?.userID === user.internalUserId ||
+        a?.internalUserID === user.internalUserId ||
+        (a?.fullName || "").toLowerCase() === (user.name || "").toLowerCase()
+      );
+      if (found) return String(found.role || "").toUpperCase() === "MODERATOR";
+    } catch (e) {
+      console.warn("getMeetingInfo failed:", e?.message);
+    }
+  }
+  return false;
+}
+
+/* ---------------- Routes ---------------- */
 app.get("/healthz", (req, res) => res.json({ ok: true }));
 
 app.post("/webhook", async (req, res) => {
@@ -328,9 +348,20 @@ app.post("/webhook", async (req, res) => {
       const text = extractMessage(ev);
       if (!text) continue;
 
+      // Skip Ally's own messages or System echoes of Ally:
+      const uname = (user.name || "").trim().toLowerCase();
+      if (uname === (ALLY_NAME || "").toLowerCase()) continue;
+      if (uname === "system" && text.trim().startsWith(`${ALLY_NAME}:`)) continue;
+
       const question = extractQuestion(text);
-      // If role missing, allow (BBB sometimes omits role in this event)
-      const isMod = user.role ? user.role === "MODERATOR" : true;
+
+      // STRICT moderator-only: use role if provided, else confirm via getMeetingInfo
+      let isMod = false;
+      if (user.role) {
+        isMod = user.role === "MODERATOR";
+      } else {
+        isMod = await isModeratorStrict(ids, user);
+      }
 
       console.log("PARSED", {
         trigger: question !== null,
@@ -342,8 +373,8 @@ app.post("/webhook", async (req, res) => {
         q: (question || "").slice(0, 120),
       });
 
-      if (question === null) continue;   // trigger not matched
-      if (!isMod) continue;              // not a moderator
+      if (question === null) continue; // trigger not matched
+      if (!isMod) continue;            // not a moderator
 
       if (!question) {
         await bbbSendChatRobust(ids, `Usage: ${ALLY_TRIGGER} <your question>`);
@@ -367,23 +398,36 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-/* ---------- Startup ---------- */
-async function registerWebhook() {
+/* ---------------- Webhook ensure (dedupe) ---------------- */
+async function ensureWebhook() {
   try {
     const callbackURL = `${PUBLIC_BASE_URL}/webhook`;
-    const params = { callbackURL };
-    const qs = urlEncodeParams(params);
-    const checksum = crypto.createHash("sha1").update("hooks/create" + qs + BBB_SECRET).digest("hex");
-    const url = `${BBB_API_BASE}/hooks/create?${qs}&checksum=${checksum}`;
-    await axios.get(url, { timeout: 10000 });
-    console.log("Registered BBB webhook at", callbackURL);
+
+    // List hooks
+    const listChecksum = crypto.createHash("sha1").update("hooks/list" + "" + BBB_SECRET).digest("hex");
+    const listUrl = `${BBB_API_BASE}/hooks/list?checksum=${listChecksum}`;
+    const listRes = await axios.get(listUrl, { timeout: 10000 });
+    const xmlHooks = xml.parse(listRes.data)?.response?.hooks?.hook;
+    const hooks = xmlHooks ? (Array.isArray(xmlHooks) ? xmlHooks : [xmlHooks]) : [];
+    const exists = hooks.some(h => h?.callbackURL === callbackURL);
+
+    if (!exists) {
+      const params = { callbackURL };
+      const qs = urlEncodeParams(params);
+      const checksum = crypto.createHash("sha1").update("hooks/create" + qs + BBB_SECRET).digest("hex");
+      const url = `${BBB_API_BASE}/hooks/create?${qs}&checksum=${checksum}`;
+      await axios.get(url, { timeout: 10000 });
+      console.log("Registered BBB webhook at", callbackURL);
+    }
   } catch (e) {
-    console.warn("Webhook registration failed:", e?.response?.data || e.message);
+    console.warn("ensureWebhook failed:", e?.response?.data || e.message);
   }
 }
 
+/* ---------------- Startup ---------------- */
 app.listen(Number(PORT), async () => {
   console.log(`Ally bot listening on :${PORT}`);
-  await registerWebhook();
-  setInterval(registerWebhook, 5 * 60 * 1000);
+  await ensureWebhook();
+  // Re-ensure every 5 minutes (harmless if already present)
+  setInterval(ensureWebhook, 5 * 60 * 1000);
 });
