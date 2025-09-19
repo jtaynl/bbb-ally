@@ -5,10 +5,11 @@ import axios from "axios";
 import Redis from "ioredis";
 import { XMLParser } from "fast-xml-parser";
 
+/* ================= Env ================= */
 const {
   BBB_API_BASE,
   BBB_SECRET,
-  PUBLIC_BASE_URL,                    // e.g. https://skillsfuture.io/ally   (NO trailing slash)
+  PUBLIC_BASE_URL,                    // e.g. https://skillsfuture.io/ally  (NO trailing slash)
 
   // DashScope (Alibaba Cloud Model Studio App)
   DASHSCOPE_API_KEY,
@@ -45,16 +46,17 @@ const {
   // Overflow protection / session rollover
   QWEN_MAX_INPUT_CHARS = "7000",
   AUTO_RESET_ON_OVERFLOW = "true",
-
-  // Helpful hint to operators when the App’s context is too big
   OVERFLOW_HINT_ENABLED = "true",
   OVERFLOW_HINT_COOLDOWN_S = "60",
 
   // Manual reset / debug
   ALLY_RESET_PHRASES = "reset,new topic,clear,forget,reset chat,reset session,start over",
+
+  // Safer BBB chat chunk size (prevents mid-word breaks)
+  BBB_CHAT_MAX_CHARS = "450",
 } = process.env;
 
-/* ---------------- Utils ---------------- */
+/* ================= Utils ================= */
 function normalizeBaseUrl(u) { if (!u) return ""; return u.endsWith("/") ? u.slice(0, -1) : u; }
 const BASE = normalizeBaseUrl(PUBLIC_BASE_URL);
 
@@ -67,16 +69,17 @@ const app = express();
 const redis = new Redis(REDIS_URL);
 const xml = new XMLParser({ ignoreAttributes: false });
 
-/* ---------------- Body parsers (keep raw for signature) ---------------- */
+/* ================= Body parsers (keep raw for signature) ================= */
 const rawSaver = (req, res, buf) => { req.rawBody = buf ? buf.toString("utf8") : ""; };
 app.use(bodyParser.urlencoded({ extended: false, verify: rawSaver }));
 app.use(bodyParser.json({ verify: rawSaver }));
 
-/* ---------------- BBB helpers ---------------- */
+/* ================= BBB helpers ================= */
 function urlEncodeParams(params) { return new URLSearchParams(params).toString(); }
 function bbbChecksum(callName, qsNoChecksum) {
   return crypto.createHash("sha1").update(callName + qsNoChecksum + BBB_SECRET).digest("hex");
 }
+
 async function bbbGet(callName, params = {}) {
   const qs = urlEncodeParams(params);
   const checksum = bbbChecksum(callName, qs);
@@ -84,10 +87,41 @@ async function bbbGet(callName, params = {}) {
   const res = await axios.get(url, { timeout: 10000 });
   return xml.parse(res.data);
 }
-async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
-  const MAX = 500;
+
+/* ----- smartChunk: split text on natural boundaries (no mid-word breaks) ----- */
+function smartChunk(text, maxLen) {
   const chunks = [];
-  for (let i = 0; i < text.length; i += MAX) chunks.push(text.slice(i, i + MAX));
+  const max = Math.max(40, maxLen | 0); // at least 40 chars
+  let s = String(text || "");
+
+  // normalize newlines
+  s = s.replace(/\r\n/g, "\n").replace(/\u200b/g, ""); // remove zero-width spaces
+
+  while (s.length > max) {
+    // choose the best break before max
+    const window = s.slice(0, max + 1);
+
+    // preference order: double newline, single newline, sentence end, bullet end, space
+    const idx =
+      window.lastIndexOf("\n\n") !== -1 ? window.lastIndexOf("\n\n") + 2 :
+      window.lastIndexOf("\n")  !== -1 ? window.lastIndexOf("\n") + 1  :
+      Math.max(window.lastIndexOf(". "), window.lastIndexOf("? "), window.lastIndexOf("! ")) + 1 ||
+      Math.max(window.lastIndexOf("• "), window.lastIndexOf("- ")) + 1 ||
+      window.lastIndexOf(" ");
+
+    const cut = idx > 0 ? idx : max; // fallback hard cut
+    chunks.push(s.slice(0, cut));
+    s = s.slice(cut);
+  }
+  if (s.length) chunks.push(s);
+  return chunks;
+}
+
+// Send chat: try external meeting ID, then internal
+async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
+  const MAX = Math.max(120, Number(BBB_CHAT_MAX_CHARS) || 450);
+  const chunks = smartChunk(text, MAX);
+
   async function sendWith(meetingID) {
     for (const c of chunks) {
       const params = { meetingID, message: c };
@@ -97,9 +131,10 @@ async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
       await axios.get(url, { timeout: 10000 });
     }
   }
-  try { if (extMeetingId) { await sendWith(extMeetingId); return true; } } catch (e) {
-    console.warn("sendChat (external) failed:", e?.response?.status || e.message);
-  }
+
+  try { if (extMeetingId) { await sendWith(extMeetingId); return true; } }
+  catch (e) { console.warn("sendChat (external) failed:", e?.response?.status || e.message); }
+
   if (intMeetingId) {
     try { await sendWith(intMeetingId); return true; }
     catch (e) { console.warn("sendChat (internal) failed:", e?.response?.status || e.message); }
@@ -107,7 +142,7 @@ async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
   return false;
 }
 
-/* ---------------- Signature verification ---------------- */
+/* ================= Signature verification ================= */
 function constantTimeEquals(a, b) { try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); } catch { return false; } }
 function candidateBodies(req) {
   const list = [];
@@ -139,7 +174,7 @@ function verifyWebhookSignature(req) {
   return !strict;
 }
 
-/* ---------------- Normalization & parsing ---------------- */
+/* ================= Normalization & parsing ================= */
 const safeParse = (v) =>
   (typeof v === "string" ? (() => { try { return JSON.parse(v); } catch { return undefined; } })() : v);
 
@@ -240,7 +275,7 @@ function normalizeWebhookEvents(req) {
   return events;
 }
 
-/* ---------------- Event helpers ---------------- */
+/* ================= Event helpers ================= */
 function looksLikeChatEvent(ev) {
   const id = ev?.data?.id?.toLowerCase?.() || "";
   const attrs = ev?.data?.attributes || {};
@@ -281,7 +316,7 @@ function extractUser(ev) {
   };
 }
 
-/* ---------------- Trigger / reset / debug ---------------- */
+/* ================= Trigger / reset / debug ================= */
 function extractQuestion(text, trigger = ALLY_TRIGGER) {
   if (!text) return null;
   const norm = text.replace(/\s+/g, " ").trim();
@@ -290,28 +325,24 @@ function extractQuestion(text, trigger = ALLY_TRIGGER) {
   const m = norm.match(re);
   return m ? (m[1] ?? "") : null;
 }
-const RESET_LIST = (ALLY_RESET_PHRASES || "")
-  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+const RESET_LIST = (ALLY_RESET_PHRASES || "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 function isResetCommand(q) {
   const t = (q || "").trim().toLowerCase();
   return RESET_LIST.some(p => t === p || t.startsWith(p));
 }
-function isDebugSessionCommand(q) {
-  return (q || "").trim().toLowerCase() === "debug session";
-}
+function isDebugSessionCommand(q) { return (q || "").trim().toLowerCase() === "debug session"; }
 
-/* ---------------- DashScope: App completion ---------------- */
+/* ================= DashScope: App completion ================= */
 function isOverflowError(e) {
   const msg = e?.response?.data?.message || e?.response?.data?.error || e?.message || "";
   const code = (e?.response?.data?.code || "").toString().toLowerCase();
-  const s = msg.toLowerCase();
-  // Catch common phrasings; do NOT depend on the exact number
+  const s = (msg || "").toLowerCase();
   return (
     code.includes("invalidparameter") ||
     s.includes("range of input length") ||
     s.includes("input length range") ||
-    s.includes("input too long") ||
-    s.includes("exceeds") && s.includes("input")
+    (s.includes("exceeds") && s.includes("input")) ||
+    s.includes("too long")
   );
 }
 
@@ -319,12 +350,10 @@ async function callQwen(meetingID, userKey, prompt) {
   const redisKey = `ally:sess:${meetingID}:${userKey}`;
   let sessionId = (await redis.get(redisKey)) || null;
 
-  // Trim prompt (safety cap)
+  // Trim prompt (safety cap; the App adds its own instruction/context)
   const cap = Math.max(1, Number(QWEN_MAX_INPUT_CHARS) || 7000);
   let userPrompt = String(prompt || "");
-  if (userPrompt.length > cap) {
-    userPrompt = userPrompt.slice(0, cap - 200) + "\n\n[...truncated...]";
-  }
+  if (userPrompt.length > cap) userPrompt = userPrompt.slice(0, cap - 200) + "\n\n[...truncated...]";
 
   let finalPrompt = userPrompt;
   if (String(QWEN_CONCISE).toLowerCase() === "true") {
@@ -332,10 +361,7 @@ async function callQwen(meetingID, userKey, prompt) {
   }
 
   const url = `https://dashscope-intl.aliyuncs.com/api/v1/apps/${APP_ID}/completion`;
-  const buildPayload = (sid) => ({
-    input: { prompt: finalPrompt, ...(sid ? { session_id: sid } : {}) },
-    parameters: {}
-  });
+  const buildPayload = (sid) => ({ input: { prompt: finalPrompt, ...(sid ? { session_id: sid } : {}) }, parameters: {} });
 
   const timeout = Math.max(1000, Number(QWEN_TIMEOUT_MS) || 60000);
   const maxRetries = Math.max(0, Number(QWEN_MAX_RETRIES) || 2);
@@ -369,7 +395,7 @@ async function callQwen(meetingID, userKey, prompt) {
           if (out2.session_id) await redis.set(redisKey, out2.session_id, "EX", 60 * 60 * 24);
           return out2.text || "(no answer)";
         } catch (e2) {
-          lastErr = e2; // fall through to generic retry
+          lastErr = e2; // fall through
         }
       }
 
@@ -389,7 +415,7 @@ async function callQwen(meetingID, userKey, prompt) {
   throw lastErr;
 }
 
-/* ---------------- Moderator-only strict check ---------------- */
+/* ================= Moderator-only strict check ================= */
 async function isModeratorStrict({ extMeetingId, intMeetingId }, user) {
   const meetingIDs = [extMeetingId, intMeetingId].filter(Boolean);
   for (const meetingID of meetingIDs) {
@@ -410,7 +436,7 @@ async function isModeratorStrict({ extMeetingId, intMeetingId }, user) {
   return false;
 }
 
-/* ---------------- Webhook ensure (dedupe + optional prune) ---------------- */
+/* ================= Webhook ensure (dedupe + optional prune) ================= */
 async function ensureWebhook() {
   try {
     const callbackURL = `${BASE}/webhook`;
@@ -455,7 +481,7 @@ async function ensureWebhook() {
   }
 }
 
-/* ---------------- Routes ---------------- */
+/* ================= Routes ================= */
 app.get("/healthz", async (req, res) => {
   try { await redis.ping(); res.json({ ok: true, redis: "ok" }); }
   catch { res.json({ ok: true, redis: "error" }); }
@@ -485,10 +511,14 @@ app.post("/webhook", async (req, res) => {
       const text = extractMessage(ev);
       if (!text) continue;
 
-      // Skip Ally/System self-echo
+      // Skip Ally/System self-echo (and loader echoes)
       const uname = (user.name || "").trim().toLowerCase();
       if (uname === (ALLY_NAME || "").toLowerCase()) continue;
-      if (uname === "system" && text.trim().startsWith(`${ALLY_NAME}:`)) continue;
+      if (uname === "system") {
+        const t = text.trim();
+        if (t.startsWith(`${ALLY_NAME}:`)) continue; // our own answers echoed back
+        if (t === (ALLY_LOADING_TEXT || "⏳ Assistant is thinking…")) continue; // loader echo
+      }
 
       const question = extractQuestion(text);
 
@@ -576,7 +606,7 @@ app.post("/webhook", async (req, res) => {
               `Tips to fix in your App settings:\n` +
               `• Set **Context Turns** to 1 (or 0) in API Configuration.\n` +
               `• Shorten the **Instruction** prompt (remove long “Skills” sections & examples).\n` +
-              `• If using a Knowledge Base or Web tool, reduce **Top-K/snippet length** or disable it.\n\n` +
+              `• If using Knowledge/Web, reduce **Top-K/snippet** length or disable it temporarily.\n\n` +
               `I already cleared my memory and will keep trying once your App sends smaller context.`
             );
           }
@@ -593,7 +623,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-/* ---------------- Startup ---------------- */
+/* ================= Startup ================= */
 app.listen(Number(PORT), async () => {
   console.log(`Ally bot listening on :${PORT}`);
   await ensureWebhook();
