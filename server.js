@@ -25,18 +25,22 @@ const {
   // Loader (typing...) indicator
   ALLY_LOADING_ENABLED = "true",
   ALLY_LOADING_DELAY_MS = "1000",
-  ALLY_LOADING_TEXT = "⏳ Ally is thinking…",
+  ALLY_LOADING_TEXT = "⏳ Assistant is thinking…",
 
   // DashScope robustness
   QWEN_TIMEOUT_MS = "60000",        // HTTP timeout per attempt
   QWEN_MAX_RETRIES = "2",           // retry count on 429/5xx/timeouts
   QWEN_RETRY_BACKOFF_MS = "800",    // base backoff in ms (exponential)
+
+  // Overflow protection / session rollover
+  QWEN_MAX_INPUT_CHARS = "7000",    // hard cap on prompt we send
+  AUTO_RESET_ON_OVERFLOW = "true",  // on "Range of input length" error, clear session & retry once
+
+  // Manual reset phrases (comma-separated)
+  ALLY_RESET_PHRASES = "reset,new topic,clear,forget,reset chat,reset session,start over",
 } = process.env;
 
-function normalizeBaseUrl(u) {
-  if (!u) return "";
-  return u.endsWith("/") ? u.slice(0, -1) : u;
-}
+function normalizeBaseUrl(u) { if (!u) return ""; return u.endsWith("/") ? u.slice(0, -1) : u; }
 const BASE = normalizeBaseUrl(PUBLIC_BASE_URL);
 
 if (!BBB_API_BASE || !BBB_SECRET || !BASE || !DASHSCOPE_API_KEY || !APP_ID) {
@@ -99,16 +103,12 @@ async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
 }
 
 /* ---------------- Signature verification ---------------- */
-// bbb-webhooks builds checksum over: callbackURL + body + secret (with chosen hash alg)
 function constantTimeEquals(a, b) { try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); } catch { return false; } }
 
 function candidateBodies(req) {
   const list = [];
   if (req.rawBody) list.push(req.rawBody);
-  try {
-    const enc = new URLSearchParams(req.body).toString();
-    if (enc) list.push(enc);
-  } catch {}
+  try { const enc = new URLSearchParams(req.body).toString(); if (enc) list.push(enc); } catch {}
   try {
     const nl = Object.entries(req.body).map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`).join("\n");
     if (nl) list.push(nl);
@@ -122,10 +122,7 @@ function verifyWebhookSignature(req) {
   const cb = `${BASE}${req.path}`;
 
   if (!received) {
-    if (strict) {
-      console.warn("WEBHOOK signature missing, strict mode on. cb=", cb);
-      return false;
-    }
+    if (strict) { console.warn("WEBHOOK signature missing, strict mode on. cb=", cb); return false; }
     return true;
   }
 
@@ -139,14 +136,9 @@ function verifyWebhookSignature(req) {
     }
   }
 
-  // Debug log on failure (safe: we do NOT log BBB_SECRET)
   console.warn("WEBHOOK signature mismatch", {
-    cb,
-    received_len: received.length,
-    bodies_tried: bodies.map((b) => b.length),
-    algs_tried: algs,
-    ct: req.headers["content-type"],
-    raw_prefix: (req.rawBody || "").slice(0, 180),
+    cb, received_len: received.length, bodies_tried: bodies.map((b) => b.length),
+    algs_tried: algs, ct: req.headers["content-type"], raw_prefix: (req.rawBody || "").slice(0, 180),
   });
 
   return !strict;
@@ -156,7 +148,6 @@ function verifyWebhookSignature(req) {
 const safeParse = (v) =>
   (typeof v === "string" ? (() => { try { return JSON.parse(v); } catch { return undefined; } })() : v);
 
-// Handle raw bodies including URL-encoded `event=[{...}]`
 function normalizeFromRaw(raw) {
   const events = [];
   if (!raw) return events;
@@ -166,7 +157,7 @@ function normalizeFromRaw(raw) {
   if (s.includes("event=")) {
     try {
       const params = new URLSearchParams(s);
-      const evStr = params.get("event");          // may be an array: "[{...}]"
+      const evStr = params.get("event");
       const parsed = safeParse(evStr);
       if (Array.isArray(parsed)) events.push(...parsed);
       else if (parsed) events.push(parsed);
@@ -211,14 +202,12 @@ function normalizeFromRaw(raw) {
 function normalizeWebhookEvents(req) {
   let events = [];
 
-  // 1) Parsed object with `event` (may be array or object)
   if (req.body && req.body.event) {
     const parsed = safeParse(req.body.event) ?? req.body.event;
     if (Array.isArray(parsed)) events.push(...parsed);
     else if (parsed) events.push(parsed);
   }
 
-  // 2) Parsed array body
   if (!events.length && Array.isArray(req.body)) {
     for (const item of req.body) {
       const i = safeParse(item) ?? item;
@@ -237,7 +226,6 @@ function normalizeWebhookEvents(req) {
     }
   }
 
-  // 3) Single object with data/core
   if (!events.length && req.body && typeof req.body === "object" && !Array.isArray(req.body)) {
     if (req.body.data) events.push(req.body);
     else if (req.body.core?.body) {
@@ -246,10 +234,8 @@ function normalizeWebhookEvents(req) {
     }
   }
 
-  // 4) Fallback to raw string
   if (!events.length) events = normalizeFromRaw(req.rawBody);
 
-  // 5) Edge: urlencoded parsed into a single-key object of JSON text
   if (!events.length && req.body && typeof req.body === "object") {
     const keys = Object.keys(req.body);
     if (keys.length === 1 && (keys[0].startsWith("[") || keys[0].startsWith("{"))) {
@@ -271,7 +257,6 @@ function looksLikeChatEvent(ev) {
   return false;
 }
 
-// Extract text from attributes["chat-message"] (observed on your server)
 function extractMessage(ev) {
   const a = ev?.data?.attributes || {};
   const cm = a?.["chat-message"];
@@ -280,7 +265,6 @@ function extractMessage(ev) {
     const txt = cm.message ?? cm.text ?? cm.content ?? "";
     return String(txt || "");
   }
-  // fallback for other shapes
   return String(a?.message?.message || a?.message || a?.content || "");
 }
 
@@ -308,7 +292,7 @@ function extractUser(ev) {
   };
 }
 
-/* ---------------- Trigger handling ---------------- */
+/* ---------------- Trigger & reset handling ---------------- */
 function extractQuestion(text, trigger = ALLY_TRIGGER) {
   if (!text) return null;
   const norm = text.replace(/\s+/g, " ").trim();
@@ -318,34 +302,53 @@ function extractQuestion(text, trigger = ALLY_TRIGGER) {
   return m ? (m[1] ?? "") : null;
 }
 
+const RESET_LIST = (ALLY_RESET_PHRASES || "")
+  .split(",")
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
+function isResetCommand(q) {
+  const t = (q || "").trim().toLowerCase();
+  return RESET_LIST.some(p => t === p || t.startsWith(p));
+}
+
 /* ---------------- Model call (Alibaba Cloud Model Studio App) ---------------- */
 async function callQwen(meetingID, userKey, prompt) {
   const redisKey = `ally:sess:${meetingID}:${userKey}`;
-  const sessionId = (await redis.get(redisKey)) || null;
+  let sessionId = (await redis.get(redisKey)) || null;
 
-  let finalPrompt = prompt;
+  // Safety: trim excessive prompt to avoid hitting the app’s total length cap
+  const cap = Math.max(1, Number(QWEN_MAX_INPUT_CHARS) || 7000);
+  let userPrompt = String(prompt || "");
+  if (userPrompt.length > cap) {
+    userPrompt = userPrompt.slice(0, cap - 200) + "\n\n[...truncated...]";
+  }
+
+  let finalPrompt = userPrompt;
   if (String(QWEN_CONCISE).toLowerCase() === "true") {
-    finalPrompt = `Answer concisely (<= 6 sentences). If a list is needed, keep it short.\n\nUser: ${prompt}`;
+    finalPrompt = `Answer concisely (<= 6 sentences). If a list is needed, keep it short.\n\nUser: ${userPrompt}`;
   }
 
   const url = `https://dashscope-intl.aliyuncs.com/api/v1/apps/${APP_ID}/completion`;
-  // IMPORTANT: session_id must be INSIDE input for multi-turn
-  const payload = {
+
+  // Build payload (session_id MUST be inside input for multi-turn)
+  const buildPayload = (sid) => ({
     input: {
       prompt: finalPrompt,
-      ...(sessionId ? { session_id: sessionId } : {}),
+      ...(sid ? { session_id: sid } : {}),
     },
     parameters: {}
-  };
+  });
 
   const timeout = Math.max(1000, Number(QWEN_TIMEOUT_MS) || 60000);
   const maxRetries = Math.max(0, Number(QWEN_MAX_RETRIES) || 2);
   const backoffBase = Math.max(0, Number(QWEN_RETRY_BACKOFF_MS) || 800);
+  const autoReset = String(AUTO_RESET_ON_OVERFLOW).toLowerCase() === "true";
 
   let lastErr = null;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const res = await axios.post(url, payload, {
+      const res = await axios.post(url, buildPayload(sessionId), {
         headers: { Authorization: `Bearer ${DASHSCOPE_API_KEY}`, "Content-Type": "application/json" },
         timeout,
       });
@@ -359,6 +362,34 @@ async function callQwen(meetingID, userKey, prompt) {
       lastErr = e;
       const status = e?.response?.status;
       const code = e?.code || "";
+      const body = e?.response?.data;
+      const msg = (body && (body.message || body.error || body.msg)) || e.message || "";
+
+      // If context got too large, reset session and retry once (fresh context)
+      const looksLikeOverflow =
+        status === 400 && typeof msg === "string" &&
+        msg.toLowerCase().includes("range of input length") &&
+        msg.includes("30720");
+
+      if (looksLikeOverflow && autoReset) {
+        console.warn("DashScope overflow; clearing session and retrying once.");
+        if (sessionId) { await redis.del(redisKey); sessionId = null; }
+        // retry immediately without counting against generic retry budget
+        try {
+          const res2 = await axios.post(url, buildPayload(null), {
+            headers: { Authorization: `Bearer ${DASHSCOPE_API_KEY}`, "Content-Type": "application/json" },
+            timeout,
+          });
+          const out2 = res2.data?.output || {};
+          if (out2.session_id) await redis.set(redisKey, out2.session_id, "EX", 60 * 60 * 24);
+          return out2.text || "(no answer)";
+        } catch (e2) {
+          lastErr = e2;
+          // fall through to normal retry handling
+        }
+      }
+
+      // Generic retry on transient issues
       const retriable =
         !e.response || status === 429 || status >= 500 ||
         code === "ECONNABORTED" || code === "ETIMEDOUT" || code === "ECONNRESET";
@@ -443,10 +474,16 @@ async function ensureWebhook() {
 }
 
 /* ---------------- Routes ---------------- */
-app.get("/healthz", (req, res) => res.json({ ok: true }));
+app.get("/healthz", async (req, res) => {
+  try {
+    await redis.ping();
+    res.json({ ok: true, redis: "ok" });
+  } catch {
+    res.json({ ok: true, redis: "error" });
+  }
+});
 
 app.post("/webhook", async (req, res) => {
-  // Log something even if signature fails so we know traffic arrived
   console.log("INCOMING /webhook", { ct: req.headers["content-type"], qkeys: Object.keys(req.query || {}) });
 
   try {
@@ -483,11 +520,8 @@ app.post("/webhook", async (req, res) => {
       // Moderator-only: if role provided use it; else confirm via getMeetingInfo when enabled
       let isMod = true;
       if (String(ALLY_REQUIRE_MOD).toLowerCase() === "true") {
-        if (user.role) {
-          isMod = user.role === "MODERATOR";
-        } else {
-          isMod = await isModeratorStrict(ids, user);
-        }
+        if (user.role) isMod = user.role === "MODERATOR";
+        else isMod = await isModeratorStrict(ids, user);
       }
 
       console.log("PARSED", {
@@ -503,31 +537,37 @@ app.post("/webhook", async (req, res) => {
       if (question === null) continue; // trigger not matched
       if (!isMod) continue;            // not a moderator
 
+      // Manual reset commands
+      if (isResetCommand(question)) {
+        const meetingKey = ids.extMeetingId || ids.intMeetingId;
+        const userKey = user.internalUserId || user.name || "";
+        if (meetingKey && userKey) {
+          await redis.del(`ally:sess:${meetingKey}:${userKey}`);
+        }
+        await bbbSendChatRobust(ids, `${ALLY_NAME}: Context cleared. What would you like to talk about next?`);
+        continue;
+      }
+
       if (!question) {
         await bbbSendChatRobust(ids, `Usage: ${ALLY_TRIGGER} <your question>`);
         continue;
       }
 
-      // Dedupe: prevent answering the exact same question repeatedly in a short window
+      // Dedupe identical asks briefly
       const dedupKey = `ally:dedup:${ids.extMeetingId || ids.intMeetingId}:${user.internalUserId || user.name}:${crypto.createHash('sha1').update(question).digest('hex')}`;
       const dupTtl = Math.max(0, Number(DUP_TTL_SECONDS) || 0);
       if (dupTtl > 0) {
-        if (await redis.get(dedupKey)) {
-          continue; // answered this same question very recently
-        }
+        if (await redis.get(dedupKey)) { continue; }
         await redis.set(dedupKey, "1", "EX", dupTtl);
       }
 
-      // ---------- LOADING INDICATOR (only if slow) ----------
+      // ---------- LOADING INDICATOR ----------
       const LOADING_ENABLED = String(ALLY_LOADING_ENABLED).toLowerCase() === "true";
       const LOADING_DELAY = Math.max(0, Number(ALLY_LOADING_DELAY_MS) || 1000);
       const LOADING_TXT = ALLY_LOADING_TEXT || "⏳ Ally is thinking…";
       let loaderTimer = null;
-
       if (LOADING_ENABLED && LOADING_DELAY > 0) {
-        loaderTimer = setTimeout(async () => {
-          try { await bbbSendChatRobust(ids, LOADING_TXT); } catch (_) {}
-        }, LOADING_DELAY);
+        loaderTimer = setTimeout(async () => { try { await bbbSendChatRobust(ids, LOADING_TXT); } catch {} }, LOADING_DELAY);
       }
 
       try {
@@ -542,7 +582,8 @@ app.post("/webhook", async (req, res) => {
         if (!ok) console.warn("Failed to send chat message via both meeting IDs");
       } catch (e) {
         if (loaderTimer) clearTimeout(loaderTimer);
-        console.error("Qwen or sendChat error:", e?.response?.data || e.message);
+        const detail = e?.response?.data || e.message;
+        console.error("Qwen or sendChat error:", detail);
         await bbbSendChatRobust(ids, `${ALLY_NAME}: Sorry, I hit an error answering that.`);
       }
     }
