@@ -26,7 +26,7 @@ if (!BBB_API_BASE || !BBB_SECRET || !PUBLIC_BASE_URL || !DASHSCOPE_API_KEY || !A
 
 const app = express();
 
-// keep raw body for signature verification
+// keep raw body for checksum + custom parsing
 const rawSaver = (req, res, buf) => { req.rawBody = buf ? buf.toString("utf8") : ""; };
 app.use(bodyParser.urlencoded({ extended: false, verify: rawSaver }));
 app.use(bodyParser.json({ verify: rawSaver }));
@@ -34,9 +34,10 @@ app.use(bodyParser.json({ verify: rawSaver }));
 const redis = new Redis(REDIS_URL);
 const xml = new XMLParser({ ignoreAttributes: false });
 
-/* ========== BBB helpers ========== */
+/* ---------- BBB helpers ---------- */
 function urlEncodeParams(params) { return new URLSearchParams(params).toString(); }
 function bbbChecksum(callName, qsNoChecksum) {
+  // API checksum: sha1(callName + queryString + secret)
   return crypto.createHash("sha1").update(callName + qsNoChecksum + BBB_SECRET).digest("hex");
 }
 async function bbbGet(callName, params = {}) {
@@ -50,7 +51,6 @@ async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
   const MAX = 500;
   const chunks = [];
   for (let i = 0; i < text.length; i += MAX) chunks.push(text.slice(i, i + MAX));
-
   async function sendWith(meetingID) {
     for (const c of chunks) {
       const params = { meetingID, message: c };
@@ -60,10 +60,8 @@ async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
       await axios.get(url, { timeout: 10000 });
     }
   }
-
-  try {
-    if (extMeetingId) { await sendWith(extMeetingId); return true; }
-  } catch (e) { console.warn("sendChat (external) failed:", e?.response?.status || e.message); }
+  try { if (extMeetingId) { await sendWith(extMeetingId); return true; } }
+  catch (e) { console.warn("sendChat (external) failed:", e?.response?.status || e.message); }
   if (intMeetingId) {
     try { await sendWith(intMeetingId); return true; }
     catch (e) { console.warn("sendChat (internal) failed:", e?.response?.status || e.message); }
@@ -71,7 +69,7 @@ async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
   return false;
 }
 
-/* ========== Signature ========== */
+/* ---------- Signature (bbb docs: sha<alg>(callbackURL + body + secret) ) ---------- */
 function constantTimeEquals(a, b) { try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); } catch { return false; } }
 function verifyWebhookSignature(req) {
   const strict = String(WEBHOOK_STRICT).toLowerCase() === "true";
@@ -97,60 +95,94 @@ function verifyWebhookSignature(req) {
   return !strict;
 }
 
-/* ========== Normalization & parsing ========== */
-function safeParse(v) { if (typeof v === "string") { try { return JSON.parse(v); } catch {} } return v; }
+/* ---------- Normalization & parsing ---------- */
+const safeParse = (v) => (typeof v === "string" ? (() => { try { return JSON.parse(v); } catch { return undefined; } })() : v);
 
-function normalizeWebhookEvents(req) {
-  let body = req.body;
-  // 0) body may be a JSON string
-  body = safeParse(body);
+function normalizeFromRaw(raw) {
+  const events = [];
+  if (!raw) return events;
+  const s = raw.trim();
 
-  // A) { event: "<json>" } or { event: {..} }
-  if (body && body.event) {
-    const ev = safeParse(body.event);
-    return ev ? [ev] : [];
+  // URL-encoded case (docs default): event=<json>&timestamp=...  (getRaw=false) :contentReference[oaicite:1]{index=1}
+  if (s.includes("event=")) {
+    try {
+      const params = new URLSearchParams(s);
+      const evStr = params.get("event");
+      const ev = safeParse(evStr);
+      if (ev) events.push(ev);
+      return events;
+    } catch {}
   }
 
-  // B) Array of things: could be [{event:"<json>"}], [{core:{body:{..}}}], or [{data:{..}}]
-  if (Array.isArray(body)) {
-    const out = [];
-    for (const item of body) {
-      const i = safeParse(item);
-      if (!i) continue;
-
-      if (i.event) {
-        const ev = safeParse(i.event);
-        if (ev) out.push(ev);
-        continue;
+  // JSON cases
+  if (s.startsWith("[") || s.startsWith("{")) {
+    const parsed = safeParse(s);
+    if (!parsed) return events;
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) {
+        const i = safeParse(item) ?? item;
+        if (i?.event) { const ev = safeParse(i.event) ?? i.event; if (ev) events.push(ev); continue; }
+        if (i?.core?.body) { const ev = safeParse(i.core.body) ?? i.core.body; if (ev) events.push(ev); continue; }
+        if (i?.data) { events.push(i); continue; }
+        if (i?.payload?.data) { events.push(i.payload); continue; }
       }
-      if (i.core && i.core.body) {
-        const ev = safeParse(i.core.body);
-        if (ev) out.push(ev);
-        continue;
-      }
-      if (i.data) {
-        out.push(i);
-        continue;
-      }
-      // sometimes BBB uses {payload:{data:{..}}}
-      if (i.payload && i.payload.data) {
-        out.push(i.payload);
-        continue;
-      }
+      return events;
+    } else {
+      if (parsed?.data) { events.push(parsed); return events; }
+      if (parsed?.core?.body) { const ev = safeParse(parsed.core.body) ?? parsed.core.body; if (ev) events.push(ev); return events; }
     }
-    return out;
   }
-
-  // C) Single raw event shape: { data:{..} } or { core:{body:{..}} }
-  if (body && body.data) return [body];
-  if (body && body.core && body.core.body) {
-    const ev = safeParse(body.core.body);
-    return ev ? [ev] : [];
-  }
-
-  return [];
+  return events;
 }
 
+function normalizeWebhookEvents(req) {
+  let events = [];
+
+  // 1) Preferred: object body with event string
+  if (req.body && req.body.event) {
+    const ev = safeParse(req.body.event) ?? req.body.event;
+    if (ev) events.push(ev);
+  }
+
+  // 2) Array body
+  if (!events.length && Array.isArray(req.body)) {
+    for (const item of req.body) {
+      const i = safeParse(item) ?? item;
+      if (i?.event) { const ev = safeParse(i.event) ?? i.event; if (ev) events.push(ev); continue; }
+      if (i?.core?.body) { const ev = safeParse(i.core.body) ?? i.core.body; if (ev) events.push(ev); continue; }
+      if (i?.data) { events.push(i); continue; }
+      if (i?.payload?.data) { events.push(i.payload); continue; }
+    }
+  }
+
+  // 3) Single object with data/core
+  if (!events.length && req.body && typeof req.body === "object" && !Array.isArray(req.body)) {
+    if (req.body.data) events.push(req.body);
+    else if (req.body.core?.body) {
+      const ev = safeParse(req.body.core.body) ?? req.body.core.body;
+      if (ev) events.push(ev);
+    }
+  }
+
+  // 4) Fallback: derive from the raw body string
+  if (!events.length) {
+    events = normalizeFromRaw(req.rawBody);
+  }
+
+  // 5) Weird edge: urlencoded parsed into { "<json>": "" }
+  if (!events.length && req.body && typeof req.body === "object") {
+    const keys = Object.keys(req.body);
+    if (keys.length === 1 && (keys[0].startsWith("[") || keys[0].startsWith("{"))) {
+      const parsed = safeParse(keys[0]);
+      if (Array.isArray(parsed)) events = parsed;
+      else if (parsed?.data) events = [parsed];
+    }
+  }
+
+  return events;
+}
+
+/* ---------- Event helpers ---------- */
 function looksLikeChatEvent(ev) {
   const id = ev?.data?.id?.toLowerCase?.() || "";
   const attrs = ev?.data?.attributes || {};
@@ -158,13 +190,10 @@ function looksLikeChatEvent(ev) {
   if (attrs?.message || attrs?.chat || attrs?.["message-id"]) return true;
   return false;
 }
-
 function extractMessage(ev) {
   const a = ev?.data?.attributes || {};
-  // message could be a plain string or an object with { message: "...", sender:{...} }
   return (a?.message?.message || a?.message || a?.content || "").toString();
 }
-
 function extractMeetingIds(ev) {
   const a = ev?.data?.attributes || {};
   const ext =
@@ -175,7 +204,6 @@ function extractMeetingIds(ev) {
     a["internal-meeting-id"] || a.internalMeetingID || "";
   return { extMeetingId: String(ext || ""), intMeetingId: String(intr || "") };
 }
-
 function extractUser(ev) {
   const a = ev?.data?.attributes || {};
   const s = a?.sender || a?.user || {};
@@ -186,36 +214,32 @@ function extractUser(ev) {
   };
 }
 
-/* ========== Trigger handling (tolerant) ========== */
+/* ---------- Trigger handling ---------- */
 function extractQuestion(text, trigger = ALLY_TRIGGER) {
   if (!text) return null;
   const norm = text.replace(/\s+/g, " ").trim();
   const esc = trigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const re = new RegExp(`^(?:\\s*)${esc}\\s*[:,-]?\\s*(.*)$`, "i");
   const m = norm.match(re);
-  if (m) return m[1] ?? "";
-  return null;
+  return m ? (m[1] ?? "") : null;
 }
 
-/* ========== Model call ========== */
+/* ---------- Model ---------- */
 async function callQwen(meetingID, userKey, prompt) {
   const redisKey = `ally:sess:${meetingID}:${userKey}`;
   const sessionId = (await redis.get(redisKey)) || null;
-
   const url = `https://dashscope-intl.aliyuncs.com/api/v1/apps/${APP_ID}/completion`;
   const payload = { input: { prompt }, ...(sessionId ? { session_id: sessionId } : {}), parameters: {} };
-
   const res = await axios.post(url, payload, {
     headers: { Authorization: `Bearer ${DASHSCOPE_API_KEY}`, "Content-Type": "application/json" },
     timeout: 20000,
   });
-
   const out = res.data?.output || {};
   if (out.session_id) await redis.set(redisKey, out.session_id, "EX", 60 * 60 * 24);
   return out.text || "(no answer)";
 }
 
-/* ========== Routes ========== */
+/* ---------- Routes ---------- */
 app.get("/healthz", (req, res) => res.json({ ok: true }));
 
 app.post("/webhook", async (req, res) => {
@@ -224,14 +248,7 @@ app.post("/webhook", async (req, res) => {
 
     const events = normalizeWebhookEvents(req);
     console.log("WEBHOOK EVENTS", Array.isArray(events) ? events.length : 0);
-
-    // show top-level keys of the first raw item for visibility
-    if (Array.isArray(req.body) && req.body.length) {
-      const keys0 = Object.keys(req.body[0]);
-      console.log("FIRST ITEM KEYS", keys0);
-    } else if (req.body && typeof req.body === "object" && !req.body.event) {
-      console.log("BODY KEYS", Object.keys(req.body));
-    }
+    console.log("CT", req.headers["content-type"], "RAW", (req.rawBody || "").slice(0, 200)); // <== NEW
 
     if (!events.length) return res.status(200).send("ok");
 
@@ -286,7 +303,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-/* ========== Startup ========== */
+/* ---------- Startup ---------- */
 async function registerWebhook() {
   try {
     const callbackURL = `${PUBLIC_BASE_URL}/webhook`;
