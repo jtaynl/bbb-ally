@@ -26,7 +26,7 @@ if (!BBB_API_BASE || !BBB_SECRET || !PUBLIC_BASE_URL || !DASHSCOPE_API_KEY || !A
 
 const app = express();
 
-// Keep raw body for signature verification
+// keep raw body for signature verification
 const rawSaver = (req, res, buf) => { req.rawBody = buf ? buf.toString("utf8") : ""; };
 app.use(bodyParser.urlencoded({ extended: false, verify: rawSaver }));
 app.use(bodyParser.json({ verify: rawSaver }));
@@ -34,7 +34,7 @@ app.use(bodyParser.json({ verify: rawSaver }));
 const redis = new Redis(REDIS_URL);
 const xml = new XMLParser({ ignoreAttributes: false });
 
-/* ---------- BBB helpers ---------- */
+/* ========== BBB helpers ========== */
 function urlEncodeParams(params) { return new URLSearchParams(params).toString(); }
 function bbbChecksum(callName, qsNoChecksum) {
   return crypto.createHash("sha1").update(callName + qsNoChecksum + BBB_SECRET).digest("hex");
@@ -63,9 +63,7 @@ async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
 
   try {
     if (extMeetingId) { await sendWith(extMeetingId); return true; }
-  } catch (e) {
-    console.warn("sendChat (external) failed:", e?.response?.status || e.message);
-  }
+  } catch (e) { console.warn("sendChat (external) failed:", e?.response?.status || e.message); }
   if (intMeetingId) {
     try { await sendWith(intMeetingId); return true; }
     catch (e) { console.warn("sendChat (internal) failed:", e?.response?.status || e.message); }
@@ -73,11 +71,8 @@ async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
   return false;
 }
 
-/* ---------- Signature ---------- */
-function constantTimeEquals(a, b) {
-  try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); }
-  catch { return false; }
-}
+/* ========== Signature ========== */
+function constantTimeEquals(a, b) { try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); } catch { return false; } }
 function verifyWebhookSignature(req) {
   const strict = String(WEBHOOK_STRICT).toLowerCase() === "true";
   const received = req.query.checksum || "";
@@ -88,9 +83,7 @@ function verifyWebhookSignature(req) {
   if (req.rawBody) candidates.push(req.rawBody);
   try { const enc = new URLSearchParams(req.body).toString(); if (enc) candidates.push(enc); } catch {}
   try {
-    const nl = Object.entries(req.body)
-      .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
-      .join("\n");
+    const nl = Object.entries(req.body).map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`).join("\n");
     if (nl) candidates.push(nl);
   } catch {}
 
@@ -104,18 +97,60 @@ function verifyWebhookSignature(req) {
   return !strict;
 }
 
-/* ---------- Event parsing ---------- */
+/* ========== Normalization & parsing ========== */
+function safeParse(v) { if (typeof v === "string") { try { return JSON.parse(v); } catch {} } return v; }
+
 function normalizeWebhookEvents(req) {
   let body = req.body;
-  if (typeof body === "string") { try { body = JSON.parse(body); } catch { return []; } }
+  // 0) body may be a JSON string
+  body = safeParse(body);
+
+  // A) { event: "<json>" } or { event: {..} }
   if (body && body.event) {
-    const ev = typeof body.event === "string" ? JSON.parse(body.event) : body.event;
-    return [ev];
+    const ev = safeParse(body.event);
+    return ev ? [ev] : [];
   }
-  if (Array.isArray(body)) return body.map(ev => (typeof ev === "string" ? JSON.parse(ev) : ev));
+
+  // B) Array of things: could be [{event:"<json>"}], [{core:{body:{..}}}], or [{data:{..}}]
+  if (Array.isArray(body)) {
+    const out = [];
+    for (const item of body) {
+      const i = safeParse(item);
+      if (!i) continue;
+
+      if (i.event) {
+        const ev = safeParse(i.event);
+        if (ev) out.push(ev);
+        continue;
+      }
+      if (i.core && i.core.body) {
+        const ev = safeParse(i.core.body);
+        if (ev) out.push(ev);
+        continue;
+      }
+      if (i.data) {
+        out.push(i);
+        continue;
+      }
+      // sometimes BBB uses {payload:{data:{..}}}
+      if (i.payload && i.payload.data) {
+        out.push(i.payload);
+        continue;
+      }
+    }
+    return out;
+  }
+
+  // C) Single raw event shape: { data:{..} } or { core:{body:{..}} }
   if (body && body.data) return [body];
+  if (body && body.core && body.core.body) {
+    const ev = safeParse(body.core.body);
+    return ev ? [ev] : [];
+  }
+
   return [];
 }
+
 function looksLikeChatEvent(ev) {
   const id = ev?.data?.id?.toLowerCase?.() || "";
   const attrs = ev?.data?.attributes || {};
@@ -123,10 +158,13 @@ function looksLikeChatEvent(ev) {
   if (attrs?.message || attrs?.chat || attrs?.["message-id"]) return true;
   return false;
 }
+
 function extractMessage(ev) {
   const a = ev?.data?.attributes || {};
+  // message could be a plain string or an object with { message: "...", sender:{...} }
   return (a?.message?.message || a?.message || a?.content || "").toString();
 }
+
 function extractMeetingIds(ev) {
   const a = ev?.data?.attributes || {};
   const ext =
@@ -137,32 +175,29 @@ function extractMeetingIds(ev) {
     a["internal-meeting-id"] || a.internalMeetingID || "";
   return { extMeetingId: String(ext || ""), intMeetingId: String(intr || "") };
 }
+
 function extractUser(ev) {
   const a = ev?.data?.attributes || {};
   const s = a?.sender || a?.user || {};
   return {
-    internalUserId: String(
-      s?.["internal-user-id"] || s?.internalUserId || s?.id || a?.["user-id"] || a?.userId || ""
-    ),
+    internalUserId: String(s?.["internal-user-id"] || s?.internalUserId || s?.id || a?.["user-id"] || a?.userId || ""),
     name: String(s?.["user-name"] || s?.name || a?.["user-name"] || a?.fullName || ""),
     role: String(s?.role || (a?.message?.sender && a.message.sender.role) || "").toUpperCase(),
   };
 }
 
-/* ---------- Trigger handling (tolerant) ---------- */
+/* ========== Trigger handling (tolerant) ========== */
 function extractQuestion(text, trigger = ALLY_TRIGGER) {
   if (!text) return null;
-  const norm = text.replace(/\s+/g, " ").trim(); // collapse spaces
-  // Build a regex that matches the trigger at start or after leading space,
-  // allows optional punctuation, then captures the rest as the question.
+  const norm = text.replace(/\s+/g, " ").trim();
   const esc = trigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const re = new RegExp(`^(?:\\s*)${esc}\\s*[:,-]?\\s*(.*)$`, "i");
   const m = norm.match(re);
-  if (m) return m[1] || ""; // may be empty if user typed only the trigger
+  if (m) return m[1] ?? "";
   return null;
 }
 
-/* ---------- Model call ---------- */
+/* ========== Model call ========== */
 async function callQwen(meetingID, userKey, prompt) {
   const redisKey = `ally:sess:${meetingID}:${userKey}`;
   const sessionId = (await redis.get(redisKey)) || null;
@@ -180,7 +215,7 @@ async function callQwen(meetingID, userKey, prompt) {
   return out.text || "(no answer)";
 }
 
-/* ---------- Routes ---------- */
+/* ========== Routes ========== */
 app.get("/healthz", (req, res) => res.json({ ok: true }));
 
 app.post("/webhook", async (req, res) => {
@@ -189,10 +224,18 @@ app.post("/webhook", async (req, res) => {
 
     const events = normalizeWebhookEvents(req);
     console.log("WEBHOOK EVENTS", Array.isArray(events) ? events.length : 0);
+
+    // show top-level keys of the first raw item for visibility
+    if (Array.isArray(req.body) && req.body.length) {
+      const keys0 = Object.keys(req.body[0]);
+      console.log("FIRST ITEM KEYS", keys0);
+    } else if (req.body && typeof req.body === "object" && !req.body.event) {
+      console.log("BODY KEYS", Object.keys(req.body));
+    }
+
     if (!events.length) return res.status(200).send("ok");
 
     for (const ev of events) {
-      // DEBUG: show event id, keys, and extracted text
       const id = ev?.data?.id;
       const attrs = ev?.data?.attributes || {};
       const textPreview = (extractMessage(ev) || "").slice(0, 120);
@@ -206,7 +249,7 @@ app.post("/webhook", async (req, res) => {
       if (!text) continue;
 
       const question = extractQuestion(text);
-      const isMod = user.role ? user.role === "MODERATOR" : true; // allow if role missing
+      const isMod = user.role ? user.role === "MODERATOR" : true;
 
       console.log("PARSED", {
         trigger: question !== null,
@@ -218,8 +261,9 @@ app.post("/webhook", async (req, res) => {
         q: (question || "").slice(0, 120),
       });
 
-      if (question === null) continue;         // trigger not matched
-      if (!isMod) continue;                    // not a moderator
+      if (question === null) continue;
+      if (!isMod) continue;
+
       if (!question) {
         await bbbSendChatRobust(ids, `Usage: ${ALLY_TRIGGER} <your question>`);
         continue;
@@ -242,7 +286,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-/* ---------- Startup ---------- */
+/* ========== Startup ========== */
 async function registerWebhook() {
   try {
     const callbackURL = `${PUBLIC_BASE_URL}/webhook`;
