@@ -53,18 +53,39 @@ async function bbbGet(callName, params = {}) {
   return xml.parse(res.data);
 }
 
-async function bbbSendChat(meetingID, text) {
-  // BBB 3.0 sendChatMessage: message 1..500 chars; split if needed
+// Robust chat sender: try external meeting ID, then internal as fallback
+async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
   const MAX = 500;
   const chunks = [];
   for (let i = 0; i < text.length; i += MAX) chunks.push(text.slice(i, i + MAX));
-  for (const c of chunks) {
-    const params = { meetingID, message: c };
-    const qs = urlEncodeParams(params);
-    const checksum = bbbChecksum("sendChatMessage", qs);
-    const url = `${BBB_API_BASE}/sendChatMessage?${qs}&checksum=${checksum}`;
-    await axios.get(url, { timeout: 10000 });
+
+  async function sendWith(meetingID) {
+    for (const c of chunks) {
+      const params = { meetingID, message: c };
+      const qs = urlEncodeParams(params);
+      const checksum = bbbChecksum("sendChatMessage", qs);
+      const url = `${BBB_API_BASE}/sendChatMessage?${qs}&checksum=${checksum}`;
+      await axios.get(url, { timeout: 10000 });
+    }
   }
+
+  try {
+    if (extMeetingId) {
+      await sendWith(extMeetingId);
+      return true;
+    }
+  } catch (e) {
+    console.warn("sendChat (external) failed:", e?.response?.status || e.message);
+  }
+  if (intMeetingId) {
+    try {
+      await sendWith(intMeetingId);
+      return true;
+    } catch (e) {
+      console.warn("sendChat (internal) failed:", e?.response?.status || e.message);
+    }
+  }
+  return false;
 }
 
 function constantTimeEquals(a, b) {
@@ -83,15 +104,14 @@ function verifyWebhookSignature(req) {
   const cb = `${PUBLIC_BASE_URL}${req.path}`;
   const bodies = [];
 
-  // 1) raw body as sent by BBB
+  // 1) raw body
   if (req.rawBody) bodies.push(req.rawBody);
   // 2) urlencoded re-encoding
   try {
     const enc = new URLSearchParams(req.body).toString();
     if (enc) bodies.push(enc);
   } catch {}
-
-  // 3) newline-joined key=value (older examples)
+  // 3) newline-joined key=value
   try {
     const nl = Object.entries(req.body)
       .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
@@ -100,7 +120,6 @@ function verifyWebhookSignature(req) {
   } catch {}
 
   const algs = [WEBHOOK_CHECKSUM_ALG, "sha1", "sha256", "sha384", "sha512"];
-
   for (const bodyStr of bodies) {
     for (const alg of algs) {
       const h = crypto.createHash(alg).update(cb + bodyStr + BBB_SECRET).digest("hex");
@@ -125,34 +144,42 @@ function extractMessage(ev) {
   return (a?.message?.message || a?.message || a?.content || "").toString();
 }
 
-function extractMeetingId(ev) {
+function extractMeetingIds(ev) {
   const a = ev?.data?.attributes || {};
-  return (
-    a?.meeting?.["external-meeting-id"] ||
-    a?.["external-meeting-id"] ||
-    a?.meeting_id ||
-    a?.meetingId ||
-    ""
-  ).toString();
+  const ext =
+    (a?.meeting && (a.meeting["external-meeting-id"] || a.meeting.externalMeetingID)) ||
+    a["external-meeting-id"] ||
+    a.externalMeetingID ||
+    a.meeting_id ||
+    a.meetingId ||
+    "";
+  const intr =
+    (a?.meeting && (a.meeting["internal-meeting-id"] || a.meeting.internalMeetingID)) ||
+    a["internal-meeting-id"] ||
+    a.internalMeetingID ||
+    "";
+  return { extMeetingId: String(ext || ""), intMeetingId: String(intr || "") };
 }
 
 function extractUser(ev) {
   const a = ev?.data?.attributes || {};
   const s = a?.sender || a?.user || {};
   return {
-    internalUserId: (
-      s?.["internal-user-id"] ||
-      s?.internalUserId ||
-      s?.id ||
-      a?.["user-id"] ||
-      a?.userId ||
-      ""
-    ).toString(),
-    name: (s?.["user-name"] || s?.name || a?.["user-name"] || a?.fullName || "").toString(),
+    internalUserId:
+      String(
+        s?.["internal-user-id"] ||
+          s?.internalUserId ||
+          s?.id ||
+          a?.["user-id"] ||
+          a?.userId ||
+          ""
+      ),
+    name: String(s?.["user-name"] || s?.name || a?.["user-name"] || a?.fullName || ""),
+    role: String(s?.role || (a?.message?.sender && a.message.sender.role) || "").toUpperCase(),
   };
 }
 
-// NEW: normalize BBB webhook body to an array of events
+// Normalize BBB webhook body to an array of events
 function normalizeWebhookEvents(req) {
   let body = req.body;
 
@@ -171,7 +198,7 @@ function normalizeWebhookEvents(req) {
     return [ev];
   }
 
-  // If BBB sent an array of events (what your server logs show)
+  // If BBB sent an array of events (what your logs show)
   if (Array.isArray(body)) {
     return body.map((ev) => (typeof ev === "string" ? JSON.parse(ev) : ev));
   }
@@ -183,28 +210,6 @@ function normalizeWebhookEvents(req) {
 }
 
 /* --------------- model call ----------------- */
-
-async function isModerator(meetingID, internalUserId) {
-  try {
-    const res = await bbbGet("getMeetingInfo", { meetingID });
-    const attendeesNode = res?.response?.attendees?.attendee;
-    const attendees = attendeesNode
-      ? Array.isArray(attendeesNode)
-        ? attendeesNode
-        : [attendeesNode]
-      : [];
-    const att = attendees.find(
-      (x) =>
-        x?.userID === internalUserId ||
-        x?.internalUserID === internalUserId ||
-        (x?.fullName || "").toLowerCase() === (internalUserId || "").toLowerCase()
-    );
-    return (att?.role || "").toUpperCase() === "MODERATOR";
-  } catch (e) {
-    console.warn("getMeetingInfo failed:", e?.message);
-    return false;
-  }
-}
 
 async function callQwen(meetingID, userKey, prompt) {
   const redisKey = `ally:sess:${meetingID}:${userKey}`;
@@ -249,25 +254,41 @@ app.post("/webhook", async (req, res) => {
     for (const ev of events) {
       if (!looksLikeChatEvent(ev)) continue;
 
-      const meetingID = extractMeetingId(ev);
+      const ids = extractMeetingIds(ev);
       const user = extractUser(ev);
       const text = extractMessage(ev);
-      if (!meetingID || !text) continue;
+      if (!text) continue;
 
-      const t = (text || "").trim();
+      const t = text.trim();
       if (!t.toLowerCase().startsWith(ALLY_TRIGGER.toLowerCase())) continue;
 
-      const mod = await isModerator(meetingID, user.internalUserId || user.name);
-      if (!mod) continue;
+      // Use role from event when available; fallback to allow if missing
+      const isMod = user.role ? user.role === "MODERATOR" : true;
+      console.log("CHAT", {
+        trigger: true,
+        role: user.role || "(unknown)",
+        isMod,
+        ext: ids.extMeetingId,
+        int: ids.intMeetingId,
+        user: user.name || user.internalUserId,
+        msg: t.slice(0, 80),
+      });
+      if (!isMod) continue;
 
       const question = t.slice(ALLY_TRIGGER.length).trim();
       if (!question) {
-        await bbbSendChat(meetingID, `Usage: ${ALLY_TRIGGER} <your question>`);
+        await bbbSendChatRobust(ids, `Usage: ${ALLY_TRIGGER} <your question>`);
         continue;
       }
 
-      const answer = await callQwen(meetingID, user.internalUserId || user.name, question);
-      await bbbSendChat(meetingID, `${ALLY_NAME}: ${answer}`);
+      try {
+        const answer = await callQwen(ids.extMeetingId || ids.intMeetingId, user.internalUserId || user.name, question);
+        const ok = await bbbSendChatRobust(ids, `${ALLY_NAME}: ${answer}`);
+        if (!ok) console.warn("Failed to send chat message via both meeting IDs");
+      } catch (e) {
+        console.error("Qwen or sendChat error:", e?.response?.data || e.message);
+        await bbbSendChatRobust(ids, `${ALLY_NAME}: Sorry, I hit an error answering that.`);
+      }
     }
 
     return res.status(200).send("ok");
