@@ -8,16 +8,19 @@ import { XMLParser } from "fast-xml-parser";
 const {
   BBB_API_BASE,
   BBB_SECRET,
-  PUBLIC_BASE_URL,           // e.g. https://skillsfuture.io/ally   (NO trailing slash)
+  PUBLIC_BASE_URL,                  // e.g. https://skillsfuture.io/ally   (NO trailing slash)
   DASHSCOPE_API_KEY,
   APP_ID,
   ALLY_TRIGGER = "@ask ally",
   ALLY_NAME = "Ally",
   REDIS_URL = "redis://localhost:6379",
   WEBHOOK_CHECKSUM_ALG = "sha256",  // matches bbb-webhooks default
-  WEBHOOK_STRICT = "true",          // set to "false" if you need to bypass temporarily
-  PORT = 8080,
+  WEBHOOK_STRICT = "true",          // set to "false" to bypass signature checks (not recommended)
   WEBHOOK_PRUNE = "false",          // set "true" to delete stale hooks not matching callbackURL
+  ALLY_REQUIRE_MOD = "true",        // require moderator role to invoke Ally
+  DUP_TTL_SECONDS = "8",            // dedupe identical prompt/user/meeting for N seconds
+  PORT = 8080,
+  QWEN_CONCISE = "false",           // if "true", nudge model for concise answers
 } = process.env;
 
 function normalizeBaseUrl(u) {
@@ -310,8 +313,13 @@ async function callQwen(meetingID, userKey, prompt) {
   const redisKey = `ally:sess:${meetingID}:${userKey}`;
   const sessionId = (await redis.get(redisKey)) || null;
 
+  let finalPrompt = prompt;
+  if (String(QWEN_CONCISE).toLowerCase() === "true") {
+    finalPrompt = `Answer concisely (<= 6 sentences). If a list is needed, keep it short.\n\nUser: ${prompt}`;
+  }
+
   const url = `https://dashscope-intl.aliyuncs.com/api/v1/apps/${APP_ID}/completion`;
-  const payload = { input: { prompt }, ...(sessionId ? { session_id: sessionId } : {}), parameters: {} };
+  const payload = { input: { prompt: finalPrompt }, ...(sessionId ? { session_id: sessionId } : {}), parameters: {} };
 
   const res = await axios.post(url, payload, {
     headers: { Authorization: `Bearer ${DASHSCOPE_API_KEY}`, "Content-Type": "application/json" },
@@ -323,7 +331,7 @@ async function callQwen(meetingID, userKey, prompt) {
   return out.text || "(no answer)";
 }
 
-/* ---------------- Moderator-only strict fallback ---------------- */
+/* ---------------- Moderator-only strict check ---------------- */
 async function isModeratorStrict({ extMeetingId, intMeetingId }, user) {
   const meetingIDs = [extMeetingId, intMeetingId].filter(Boolean);
   for (const meetingID of meetingIDs) {
@@ -430,12 +438,14 @@ app.post("/webhook", async (req, res) => {
 
       const question = extractQuestion(text);
 
-      // STRICT moderator-only: use role if provided, else confirm via getMeetingInfo
-      let isMod = false;
-      if (user.role) {
-        isMod = user.role === "MODERATOR";
-      } else {
-        isMod = await isModeratorStrict(ids, user);
+      // Moderator-only: if role provided use it; else confirm via getMeetingInfo when enabled
+      let isMod = true;
+      if (String(ALLY_REQUIRE_MOD).toLowerCase() === "true") {
+        if (user.role) {
+          isMod = user.role === "MODERATOR";
+        } else {
+          isMod = await isModeratorStrict(ids, user);
+        }
       }
 
       console.log("PARSED", {
@@ -454,6 +464,16 @@ app.post("/webhook", async (req, res) => {
       if (!question) {
         await bbbSendChatRobust(ids, `Usage: ${ALLY_TRIGGER} <your question>`);
         continue;
+      }
+
+      // Dedupe: prevent answering the exact same question repeatedly in a short window
+      const dedupKey = `ally:dedup:${ids.extMeetingId || ids.intMeetingId}:${user.internalUserId || user.name}:${crypto.createHash('sha1').update(question).digest('hex')}`;
+      const dupTtl = Math.max(0, Number(DUP_TTL_SECONDS) || 0);
+      if (dupTtl > 0) {
+        if (await redis.get(dedupKey)) {
+          continue; // answered this same question very recently
+        }
+        await redis.set(dedupKey, "1", "EX", dupTtl);
       }
 
       try {
