@@ -8,38 +8,53 @@ import { XMLParser } from "fast-xml-parser";
 const {
   BBB_API_BASE,
   BBB_SECRET,
-  PUBLIC_BASE_URL,                  // e.g. https://skillsfuture.io/ally   (NO trailing slash)
+  PUBLIC_BASE_URL,                    // e.g. https://skillsfuture.io/ally   (NO trailing slash)
+
+  // DashScope (Alibaba Cloud Model Studio App)
   DASHSCOPE_API_KEY,
   APP_ID,
+
+  // Chat trigger / name
   ALLY_TRIGGER = "@ally",
   ALLY_NAME = "Ally",
-  REDIS_URL = "redis://localhost:6379",
-  WEBHOOK_CHECKSUM_ALG = "sha256",  // matches bbb-webhooks default
-  WEBHOOK_STRICT = "true",          // set to "false" to bypass signature checks (not recommended)
-  WEBHOOK_PRUNE = "false",          // set "true" to delete stale hooks not matching callbackURL
-  ALLY_REQUIRE_MOD = "true",        // require moderator role to invoke Ally
-  DUP_TTL_SECONDS = "8",            // dedupe identical prompt/user/meeting for N seconds
-  PORT = 8080,
-  QWEN_CONCISE = "false",           // if "true", nudge model for concise answers
 
-  // Loader (typing...) indicator
+  // Infra
+  REDIS_URL = "redis://localhost:6379",
+  PORT = 8080,
+
+  // BBB webhook signature verification
+  WEBHOOK_CHECKSUM_ALG = "sha256",
+  WEBHOOK_STRICT = "true",
+  WEBHOOK_PRUNE = "false",
+
+  // Permissions & UX
+  ALLY_REQUIRE_MOD = "true",
+  DUP_TTL_SECONDS = "8",
+  QWEN_CONCISE = "false",
+
+  // Loading indicator
   ALLY_LOADING_ENABLED = "true",
   ALLY_LOADING_DELAY_MS = "1000",
   ALLY_LOADING_TEXT = "⏳ Assistant is thinking…",
 
-  // DashScope robustness
-  QWEN_TIMEOUT_MS = "60000",        // HTTP timeout per attempt
-  QWEN_MAX_RETRIES = "2",           // retry count on 429/5xx/timeouts
-  QWEN_RETRY_BACKOFF_MS = "800",    // base backoff in ms (exponential)
+  // DashScope call robustness
+  QWEN_TIMEOUT_MS = "60000",
+  QWEN_MAX_RETRIES = "2",
+  QWEN_RETRY_BACKOFF_MS = "800",
 
   // Overflow protection / session rollover
-  QWEN_MAX_INPUT_CHARS = "7000",    // hard cap on prompt we send
-  AUTO_RESET_ON_OVERFLOW = "true",  // on "Range of input length" error, clear session & retry once
+  QWEN_MAX_INPUT_CHARS = "7000",
+  AUTO_RESET_ON_OVERFLOW = "true",
 
-  // Manual reset phrases (comma-separated)
+  // Helpful hint to operators when the App’s context is too big
+  OVERFLOW_HINT_ENABLED = "true",
+  OVERFLOW_HINT_COOLDOWN_S = "60",
+
+  // Manual reset / debug
   ALLY_RESET_PHRASES = "reset,new topic,clear,forget,reset chat,reset session,start over",
 } = process.env;
 
+/* ---------------- Utils ---------------- */
 function normalizeBaseUrl(u) { if (!u) return ""; return u.endsWith("/") ? u.slice(0, -1) : u; }
 const BASE = normalizeBaseUrl(PUBLIC_BASE_URL);
 
@@ -49,23 +64,19 @@ if (!BBB_API_BASE || !BBB_SECRET || !BASE || !DASHSCOPE_API_KEY || !APP_ID) {
 }
 
 const app = express();
+const redis = new Redis(REDIS_URL);
+const xml = new XMLParser({ ignoreAttributes: false });
 
-// Keep raw body for signature + custom parsing
+/* ---------------- Body parsers (keep raw for signature) ---------------- */
 const rawSaver = (req, res, buf) => { req.rawBody = buf ? buf.toString("utf8") : ""; };
 app.use(bodyParser.urlencoded({ extended: false, verify: rawSaver }));
 app.use(bodyParser.json({ verify: rawSaver }));
 
-const redis = new Redis(REDIS_URL);
-const xml = new XMLParser({ ignoreAttributes: false });
-
 /* ---------------- BBB helpers ---------------- */
 function urlEncodeParams(params) { return new URLSearchParams(params).toString(); }
-
 function bbbChecksum(callName, qsNoChecksum) {
-  // BBB API: sha1(callName + queryString + secret)
   return crypto.createHash("sha1").update(callName + qsNoChecksum + BBB_SECRET).digest("hex");
 }
-
 async function bbbGet(callName, params = {}) {
   const qs = urlEncodeParams(params);
   const checksum = bbbChecksum(callName, qs);
@@ -73,13 +84,10 @@ async function bbbGet(callName, params = {}) {
   const res = await axios.get(url, { timeout: 10000 });
   return xml.parse(res.data);
 }
-
-// Send chat: try external meeting ID, then internal
 async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
   const MAX = 500;
   const chunks = [];
   for (let i = 0; i < text.length; i += MAX) chunks.push(text.slice(i, i + MAX));
-
   async function sendWith(meetingID) {
     for (const c of chunks) {
       const params = { meetingID, message: c };
@@ -89,10 +97,7 @@ async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
       await axios.get(url, { timeout: 10000 });
     }
   }
-
-  try {
-    if (extMeetingId) { await sendWith(extMeetingId); return true; }
-  } catch (e) {
+  try { if (extMeetingId) { await sendWith(extMeetingId); return true; } } catch (e) {
     console.warn("sendChat (external) failed:", e?.response?.status || e.message);
   }
   if (intMeetingId) {
@@ -104,7 +109,6 @@ async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
 
 /* ---------------- Signature verification ---------------- */
 function constantTimeEquals(a, b) { try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); } catch { return false; } }
-
 function candidateBodies(req) {
   const list = [];
   if (req.rawBody) list.push(req.rawBody);
@@ -115,32 +119,23 @@ function candidateBodies(req) {
   } catch {}
   return list;
 }
-
 function verifyWebhookSignature(req) {
   const strict = String(WEBHOOK_STRICT).toLowerCase() === "true";
   const received = req.query.checksum || "";
   const cb = `${BASE}${req.path}`;
-
-  if (!received) {
-    if (strict) { console.warn("WEBHOOK signature missing, strict mode on. cb=", cb); return false; }
-    return true;
-  }
-
+  if (!received) { if (strict) { console.warn("WEBHOOK signature missing, strict mode on. cb=", cb); return false; } return true; }
   const bodies = candidateBodies(req);
   const algs = [WEBHOOK_CHECKSUM_ALG, "sha1", "sha256", "sha384", "sha512"];
-
   for (const bodyStr of bodies) {
     for (const alg of algs) {
       const h = crypto.createHash(alg).update(cb + bodyStr + BBB_SECRET).digest("hex");
       if (constantTimeEquals(h, received)) return true;
     }
   }
-
   console.warn("WEBHOOK signature mismatch", {
     cb, received_len: received.length, bodies_tried: bodies.map((b) => b.length),
     algs_tried: algs, ct: req.headers["content-type"], raw_prefix: (req.rawBody || "").slice(0, 180),
   });
-
   return !strict;
 }
 
@@ -153,7 +148,6 @@ function normalizeFromRaw(raw) {
   if (!raw) return events;
   const s = raw.trim();
 
-  // application/x-www-form-urlencoded: event=<json or json-array>&timestamp=...
   if (s.includes("event=")) {
     try {
       const params = new URLSearchParams(s);
@@ -165,7 +159,6 @@ function normalizeFromRaw(raw) {
     } catch {}
   }
 
-  // Raw JSON bodies (rare)
   if (s.startsWith("[") || s.startsWith("{")) {
     const parsed = safeParse(s);
     if (!parsed) return events;
@@ -244,7 +237,6 @@ function normalizeWebhookEvents(req) {
       else if (parsed?.data) events = [parsed];
     }
   }
-
   return events;
 }
 
@@ -256,7 +248,6 @@ function looksLikeChatEvent(ev) {
   if (attrs?.["chat-message"] || attrs?.message || attrs?.chat || attrs?.["message-id"]) return true;
   return false;
 }
-
 function extractMessage(ev) {
   const a = ev?.data?.attributes || {};
   const cm = a?.["chat-message"];
@@ -267,7 +258,6 @@ function extractMessage(ev) {
   }
   return String(a?.message?.message || a?.message || a?.content || "");
 }
-
 function extractMeetingIds(ev) {
   const a = ev?.data?.attributes || {};
   const ext =
@@ -278,7 +268,6 @@ function extractMeetingIds(ev) {
     a["internal-meeting-id"] || a.internalMeetingID || "";
   return { extMeetingId: String(ext || ""), intMeetingId: String(intr || "") };
 }
-
 function extractUser(ev) {
   const a = ev?.data?.attributes || {};
   const cm = a?.["chat-message"];
@@ -292,7 +281,7 @@ function extractUser(ev) {
   };
 }
 
-/* ---------------- Trigger & reset handling ---------------- */
+/* ---------------- Trigger / reset / debug ---------------- */
 function extractQuestion(text, trigger = ALLY_TRIGGER) {
   if (!text) return null;
   const norm = text.replace(/\s+/g, " ").trim();
@@ -301,23 +290,36 @@ function extractQuestion(text, trigger = ALLY_TRIGGER) {
   const m = norm.match(re);
   return m ? (m[1] ?? "") : null;
 }
-
 const RESET_LIST = (ALLY_RESET_PHRASES || "")
-  .split(",")
-  .map(s => s.trim().toLowerCase())
-  .filter(Boolean);
-
+  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 function isResetCommand(q) {
   const t = (q || "").trim().toLowerCase();
   return RESET_LIST.some(p => t === p || t.startsWith(p));
 }
+function isDebugSessionCommand(q) {
+  return (q || "").trim().toLowerCase() === "debug session";
+}
 
-/* ---------------- Model call (Alibaba Cloud Model Studio App) ---------------- */
+/* ---------------- DashScope: App completion ---------------- */
+function isOverflowError(e) {
+  const msg = e?.response?.data?.message || e?.response?.data?.error || e?.message || "";
+  const code = (e?.response?.data?.code || "").toString().toLowerCase();
+  const s = msg.toLowerCase();
+  // Catch common phrasings; do NOT depend on the exact number
+  return (
+    code.includes("invalidparameter") ||
+    s.includes("range of input length") ||
+    s.includes("input length range") ||
+    s.includes("input too long") ||
+    s.includes("exceeds") && s.includes("input")
+  );
+}
+
 async function callQwen(meetingID, userKey, prompt) {
   const redisKey = `ally:sess:${meetingID}:${userKey}`;
   let sessionId = (await redis.get(redisKey)) || null;
 
-  // Safety: trim excessive prompt to avoid hitting the app’s total length cap
+  // Trim prompt (safety cap)
   const cap = Math.max(1, Number(QWEN_MAX_INPUT_CHARS) || 7000);
   let userPrompt = String(prompt || "");
   if (userPrompt.length > cap) {
@@ -326,17 +328,12 @@ async function callQwen(meetingID, userKey, prompt) {
 
   let finalPrompt = userPrompt;
   if (String(QWEN_CONCISE).toLowerCase() === "true") {
-    finalPrompt = `Answer concisely (<= 6 sentences). If a list is needed, keep it short.\n\nUser: ${userPrompt}`;
+    finalPrompt = `Answer concisely (≤6 sentences). If a list is needed, keep it short.\n\nUser: ${userPrompt}`;
   }
 
   const url = `https://dashscope-intl.aliyuncs.com/api/v1/apps/${APP_ID}/completion`;
-
-  // Build payload (session_id MUST be inside input for multi-turn)
   const buildPayload = (sid) => ({
-    input: {
-      prompt: finalPrompt,
-      ...(sid ? { session_id: sid } : {}),
-    },
+    input: { prompt: finalPrompt, ...(sid ? { session_id: sid } : {}) },
     parameters: {}
   });
 
@@ -353,28 +350,16 @@ async function callQwen(meetingID, userKey, prompt) {
         timeout,
       });
       const out = res.data?.output || {};
-      if (out.session_id && out.session_id !== sessionId) {
-        console.log("Qwen returned new session_id:", out.session_id);
-      }
-      if (out.session_id) await redis.set(redisKey, out.session_id, "EX", 60 * 60 * 24); // 24h TTL
+      if (out.session_id && out.session_id !== sessionId) console.log("Qwen returned new session_id:", out.session_id);
+      if (out.session_id) await redis.set(redisKey, out.session_id, "EX", 60 * 60 * 24);
       return out.text || "(no answer)";
     } catch (e) {
       lastErr = e;
-      const status = e?.response?.status;
-      const code = e?.code || "";
-      const body = e?.response?.data;
-      const msg = (body && (body.message || body.error || body.msg)) || e.message || "";
 
-      // If context got too large, reset session and retry once (fresh context)
-      const looksLikeOverflow =
-        status === 400 && typeof msg === "string" &&
-        msg.toLowerCase().includes("range of input length") &&
-        msg.includes("30720");
-
-      if (looksLikeOverflow && autoReset) {
-        console.warn("DashScope overflow; clearing session and retrying once.");
+      // If the App overflows, try once with a clean session (no memory)
+      if (isOverflowError(e) && autoReset) {
+        console.warn("DashScope overflow; clearing session and retrying once with a fresh session_id.");
         if (sessionId) { await redis.del(redisKey); sessionId = null; }
-        // retry immediately without counting against generic retry budget
         try {
           const res2 = await axios.post(url, buildPayload(null), {
             headers: { Authorization: `Bearer ${DASHSCOPE_API_KEY}`, "Content-Type": "application/json" },
@@ -384,15 +369,15 @@ async function callQwen(meetingID, userKey, prompt) {
           if (out2.session_id) await redis.set(redisKey, out2.session_id, "EX", 60 * 60 * 24);
           return out2.text || "(no answer)";
         } catch (e2) {
-          lastErr = e2;
-          // fall through to normal retry handling
+          lastErr = e2; // fall through to generic retry
         }
       }
 
-      // Generic retry on transient issues
-      const retriable =
-        !e.response || status === 429 || status >= 500 ||
-        code === "ECONNABORTED" || code === "ETIMEDOUT" || code === "ECONNRESET";
+      // Transient retry (timeouts / 5xx / 429)
+      const status = e?.response?.status;
+      const code = e?.code || "";
+      const retriable = !e.response || status === 429 || status >= 500 ||
+                        code === "ECONNABORTED" || code === "ETIMEDOUT" || code === "ECONNRESET";
       if (attempt < maxRetries && retriable) {
         const delay = backoffBase * Math.pow(2, attempt);
         await new Promise(r => setTimeout(r, delay));
@@ -429,8 +414,6 @@ async function isModeratorStrict({ extMeetingId, intMeetingId }, user) {
 async function ensureWebhook() {
   try {
     const callbackURL = `${BASE}/webhook`;
-
-    // List hooks
     const listChecksum = crypto.createHash("sha1").update("hooks/list" + "" + BBB_SECRET).digest("hex");
     const listUrl = `${BBB_API_BASE}/hooks/list?checksum=${listChecksum}`;
     const listRes = await axios.get(listUrl, { timeout: 10000 });
@@ -450,7 +433,6 @@ async function ensureWebhook() {
     }
 
     if (String(WEBHOOK_PRUNE).toLowerCase() === "true") {
-      // Optional: remove any other hooks that do not match our callbackURL
       for (const h of hooks) {
         const cb = h?.callbackURL;
         if (cb && cb !== callbackURL) {
@@ -475,26 +457,19 @@ async function ensureWebhook() {
 
 /* ---------------- Routes ---------------- */
 app.get("/healthz", async (req, res) => {
-  try {
-    await redis.ping();
-    res.json({ ok: true, redis: "ok" });
-  } catch {
-    res.json({ ok: true, redis: "error" });
-  }
+  try { await redis.ping(); res.json({ ok: true, redis: "ok" }); }
+  catch { res.json({ ok: true, redis: "error" }); }
 });
 
 app.post("/webhook", async (req, res) => {
   console.log("INCOMING /webhook", { ct: req.headers["content-type"], qkeys: Object.keys(req.query || {}) });
 
   try {
-    if (!verifyWebhookSignature(req)) {
-      return res.status(403).send("bad signature");
-    }
+    if (!verifyWebhookSignature(req)) return res.status(403).send("bad signature");
 
     const events = normalizeWebhookEvents(req);
     console.log("WEBHOOK EVENTS", Array.isArray(events) ? events.length : 0);
     console.log("CT", req.headers["content-type"], "RAW", (req.rawBody || "").slice(0, 200));
-
     if (!events.length) return res.status(200).send("ok");
 
     for (const ev of events) {
@@ -517,7 +492,7 @@ app.post("/webhook", async (req, res) => {
 
       const question = extractQuestion(text);
 
-      // Moderator-only: if role provided use it; else confirm via getMeetingInfo when enabled
+      // Moderator-only (if enabled)
       let isMod = true;
       if (String(ALLY_REQUIRE_MOD).toLowerCase() === "true") {
         if (user.role) isMod = user.role === "MODERATOR";
@@ -534,34 +509,38 @@ app.post("/webhook", async (req, res) => {
         q: (question || "").slice(0, 120),
       });
 
-      if (question === null) continue; // trigger not matched
-      if (!isMod) continue;            // not a moderator
+      if (question === null) continue;
+      if (!isMod) continue;
 
-      // Manual reset commands
+      // Manual reset
       if (isResetCommand(question)) {
         const meetingKey = ids.extMeetingId || ids.intMeetingId;
         const userKey = user.internalUserId || user.name || "";
-        if (meetingKey && userKey) {
-          await redis.del(`ally:sess:${meetingKey}:${userKey}`);
-        }
+        if (meetingKey && userKey) await redis.del(`ally:sess:${meetingKey}:${userKey}`);
         await bbbSendChatRobust(ids, `${ALLY_NAME}: Context cleared. What would you like to talk about next?`);
         continue;
       }
 
-      if (!question) {
-        await bbbSendChatRobust(ids, `Usage: ${ALLY_TRIGGER} <your question>`);
+      // Debug: show session status
+      if (isDebugSessionCommand(question)) {
+        const meetingKey = ids.extMeetingId || ids.intMeetingId;
+        const userKey = user.internalUserId || user.name || "";
+        const sid = meetingKey && userKey ? await redis.get(`ally:sess:${meetingKey}:${userKey}`) : null;
+        await bbbSendChatRobust(ids, `${ALLY_NAME}: session_id=${sid ? sid : "(none)"}  • meeting=${meetingKey || "(n/a)"}  • user=${userKey || "(n/a)"}`);
         continue;
       }
+
+      if (!question) { await bbbSendChatRobust(ids, `Usage: ${ALLY_TRIGGER} <your question>`); continue; }
 
       // Dedupe identical asks briefly
       const dedupKey = `ally:dedup:${ids.extMeetingId || ids.intMeetingId}:${user.internalUserId || user.name}:${crypto.createHash('sha1').update(question).digest('hex')}`;
       const dupTtl = Math.max(0, Number(DUP_TTL_SECONDS) || 0);
       if (dupTtl > 0) {
-        if (await redis.get(dedupKey)) { continue; }
+        if (await redis.get(dedupKey)) continue;
         await redis.set(dedupKey, "1", "EX", dupTtl);
       }
 
-      // ---------- LOADING INDICATOR ----------
+      // Loading indicator
       const LOADING_ENABLED = String(ALLY_LOADING_ENABLED).toLowerCase() === "true";
       const LOADING_DELAY = Math.max(0, Number(ALLY_LOADING_DELAY_MS) || 1000);
       const LOADING_TXT = ALLY_LOADING_TEXT || "⏳ Ally is thinking…";
@@ -582,8 +561,27 @@ app.post("/webhook", async (req, res) => {
         if (!ok) console.warn("Failed to send chat message via both meeting IDs");
       } catch (e) {
         if (loaderTimer) clearTimeout(loaderTimer);
+
         const detail = e?.response?.data || e.message;
         console.error("Qwen or sendChat error:", detail);
+
+        // Helpful operator hint when the App is injecting too much context
+        if (isOverflowError(e) && String(OVERFLOW_HINT_ENABLED).toLowerCase() === "true") {
+          const key = `ally:overflow-hint:${ids.extMeetingId || ids.intMeetingId}`;
+          const cooldown = Math.max(5, Number(OVERFLOW_HINT_COOLDOWN_S) || 60);
+          if (!(await redis.get(key))) {
+            await redis.set(key, "1", "EX", cooldown);
+            await bbbSendChatRobust(ids,
+              `${ALLY_NAME}: The request was rejected because the Model Studio **App** input is too large.\n` +
+              `Tips to fix in your App settings:\n` +
+              `• Set **Context Turns** to 1 (or 0) in API Configuration.\n` +
+              `• Shorten the **Instruction** prompt (remove long “Skills” sections & examples).\n` +
+              `• If using a Knowledge Base or Web tool, reduce **Top-K/snippet length** or disable it.\n\n` +
+              `I already cleared my memory and will keep trying once your App sends smaller context.`
+            );
+          }
+        }
+
         await bbbSendChatRobust(ids, `${ALLY_NAME}: Sorry, I hit an error answering that.`);
       }
     }
