@@ -11,7 +11,7 @@ const {
   PUBLIC_BASE_URL,                  // e.g. https://skillsfuture.io/ally   (NO trailing slash)
   DASHSCOPE_API_KEY,
   APP_ID,
-  ALLY_TRIGGER = "@ask ally",
+  ALLY_TRIGGER = "@ally",
   ALLY_NAME = "Ally",
   REDIS_URL = "redis://localhost:6379",
   WEBHOOK_CHECKSUM_ALG = "sha256",  // matches bbb-webhooks default
@@ -21,6 +21,16 @@ const {
   DUP_TTL_SECONDS = "8",            // dedupe identical prompt/user/meeting for N seconds
   PORT = 8080,
   QWEN_CONCISE = "false",           // if "true", nudge model for concise answers
+
+  // Loader (typing...) indicator
+  ALLY_LOADING_ENABLED = "true",
+  ALLY_LOADING_DELAY_MS = "1000",
+  ALLY_LOADING_TEXT = "⏳ Ally is thinking…",
+
+  // DashScope robustness
+  QWEN_TIMEOUT_MS = "60000",        // HTTP timeout per attempt
+  QWEN_MAX_RETRIES = "2",           // retry count on 429/5xx/timeouts
+  QWEN_RETRY_BACKOFF_MS = "800",    // base backoff in ms (exponential)
 } = process.env;
 
 function normalizeBaseUrl(u) {
@@ -323,22 +333,44 @@ async function callQwen(meetingID, userKey, prompt) {
   const payload = {
     input: {
       prompt: finalPrompt,
-      ...(sessionId ? { session_id: sessionId } : {}),   // <-- fix for multi-turn
+      ...(sessionId ? { session_id: sessionId } : {}),
     },
     parameters: {}
   };
 
-  const res = await axios.post(url, payload, {
-    headers: { Authorization: `Bearer ${DASHSCOPE_API_KEY}`, "Content-Type": "application/json" },
-    timeout: 20000,
-  });
+  const timeout = Math.max(1000, Number(QWEN_TIMEOUT_MS) || 60000);
+  const maxRetries = Math.max(0, Number(QWEN_MAX_RETRIES) || 2);
+  const backoffBase = Math.max(0, Number(QWEN_RETRY_BACKOFF_MS) || 800);
 
-  const out = res.data?.output || {};
-  if (out.session_id && out.session_id !== sessionId) {
-    console.log("Qwen returned new session_id:", out.session_id);
+  let lastErr = null;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await axios.post(url, payload, {
+        headers: { Authorization: `Bearer ${DASHSCOPE_API_KEY}`, "Content-Type": "application/json" },
+        timeout,
+      });
+      const out = res.data?.output || {};
+      if (out.session_id && out.session_id !== sessionId) {
+        console.log("Qwen returned new session_id:", out.session_id);
+      }
+      if (out.session_id) await redis.set(redisKey, out.session_id, "EX", 60 * 60 * 24); // 24h TTL
+      return out.text || "(no answer)";
+    } catch (e) {
+      lastErr = e;
+      const status = e?.response?.status;
+      const code = e?.code || "";
+      const retriable =
+        !e.response || status === 429 || status >= 500 ||
+        code === "ECONNABORTED" || code === "ETIMEDOUT" || code === "ECONNRESET";
+      if (attempt < maxRetries && retriable) {
+        const delay = backoffBase * Math.pow(2, attempt);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      throw e;
+    }
   }
-  if (out.session_id) await redis.set(redisKey, out.session_id, "EX", 60 * 60 * 24); // 24h TTL
-  return out.text || "(no answer)";
+  throw lastErr;
 }
 
 /* ---------------- Moderator-only strict check ---------------- */
@@ -486,11 +518,30 @@ app.post("/webhook", async (req, res) => {
         await redis.set(dedupKey, "1", "EX", dupTtl);
       }
 
+      // ---------- LOADING INDICATOR (only if slow) ----------
+      const LOADING_ENABLED = String(ALLY_LOADING_ENABLED).toLowerCase() === "true";
+      const LOADING_DELAY = Math.max(0, Number(ALLY_LOADING_DELAY_MS) || 1000);
+      const LOADING_TXT = ALLY_LOADING_TEXT || "⏳ Ally is thinking…";
+      let loaderTimer = null;
+
+      if (LOADING_ENABLED && LOADING_DELAY > 0) {
+        loaderTimer = setTimeout(async () => {
+          try { await bbbSendChatRobust(ids, LOADING_TXT); } catch (_) {}
+        }, LOADING_DELAY);
+      }
+
       try {
-        const answer = await callQwen(ids.extMeetingId || ids.intMeetingId, user.internalUserId || user.name, question);
+        const answer = await callQwen(
+          ids.extMeetingId || ids.intMeetingId,
+          user.internalUserId || user.name,
+          question
+        );
+        if (loaderTimer) clearTimeout(loaderTimer);
+
         const ok = await bbbSendChatRobust(ids, `${ALLY_NAME}: ${answer}`);
         if (!ok) console.warn("Failed to send chat message via both meeting IDs");
       } catch (e) {
+        if (loaderTimer) clearTimeout(loaderTimer);
         console.error("Qwen or sendChat error:", e?.response?.data || e.message);
         await bbbSendChatRobust(ids, `${ALLY_NAME}: Sorry, I hit an error answering that.`);
       }
