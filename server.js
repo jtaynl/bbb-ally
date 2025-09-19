@@ -8,25 +8,32 @@ import { XMLParser } from "fast-xml-parser";
 const {
   BBB_API_BASE,
   BBB_SECRET,
-  PUBLIC_BASE_URL,           // e.g. https://skillsfuture.io/ally
+  PUBLIC_BASE_URL,           // e.g. https://skillsfuture.io/ally   (NO trailing slash)
   DASHSCOPE_API_KEY,
   APP_ID,
   ALLY_TRIGGER = "@ask ally",
   ALLY_NAME = "Ally",
   REDIS_URL = "redis://localhost:6379",
-  WEBHOOK_CHECKSUM_ALG = "sha256",  // bbb-webhooks default
-  WEBHOOK_STRICT = "true",          // recommended
+  WEBHOOK_CHECKSUM_ALG = "sha256",  // matches bbb-webhooks default
+  WEBHOOK_STRICT = "true",          // set to "false" if you need to bypass temporarily
   PORT = 8080,
+  WEBHOOK_PRUNE = "false",          // set "true" to delete stale hooks not matching callbackURL
 } = process.env;
 
-if (!BBB_API_BASE || !BBB_SECRET || !PUBLIC_BASE_URL || !DASHSCOPE_API_KEY || !APP_ID) {
-  console.error("Missing required env vars. Check .env");
+function normalizeBaseUrl(u) {
+  if (!u) return "";
+  return u.endsWith("/") ? u.slice(0, -1) : u;
+}
+const BASE = normalizeBaseUrl(PUBLIC_BASE_URL);
+
+if (!BBB_API_BASE || !BBB_SECRET || !BASE || !DASHSCOPE_API_KEY || !APP_ID) {
+  console.error("Missing required env vars. Check .env (BBB_API_BASE, BBB_SECRET, PUBLIC_BASE_URL, DASHSCOPE_API_KEY, APP_ID)");
   process.exit(1);
 }
 
 const app = express();
 
-// Keep raw body for signature verification + custom parsing
+// Keep raw body for signature + custom parsing
 const rawSaver = (req, res, buf) => { req.rawBody = buf ? buf.toString("utf8") : ""; };
 app.use(bodyParser.urlencoded({ extended: false, verify: rawSaver }));
 app.use(bodyParser.json({ verify: rawSaver }));
@@ -82,38 +89,53 @@ async function bbbSendChatRobust({ extMeetingId, intMeetingId }, text) {
 // bbb-webhooks builds checksum over: callbackURL + body + secret (with chosen hash alg)
 function constantTimeEquals(a, b) { try { return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b)); } catch { return false; } }
 
+function candidateBodies(req) {
+  const list = [];
+  if (req.rawBody) list.push(req.rawBody);
+  try {
+    const enc = new URLSearchParams(req.body).toString();
+    if (enc) list.push(enc);
+  } catch {}
+  try {
+    const nl = Object.entries(req.body).map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`).join("\n");
+    if (nl) list.push(nl);
+  } catch {}
+  return list;
+}
+
 function verifyWebhookSignature(req) {
   const strict = String(WEBHOOK_STRICT).toLowerCase() === "true";
   const received = req.query.checksum || "";
-  if (!received) return !strict;
+  const cb = `${BASE}${req.path}`;
 
-  const cb = `${PUBLIC_BASE_URL}${req.path}`;
-  const candidates = [];
+  if (!received) {
+    if (strict) {
+      console.warn("WEBHOOK signature missing, strict mode on. cb=", cb);
+      return false;
+    }
+    return true;
+  }
 
-  // 1) exact raw body string
-  if (req.rawBody) candidates.push(req.rawBody);
-
-  // 2) urlencoded re-encoding
-  try {
-    const enc = new URLSearchParams(req.body).toString();
-    if (enc) candidates.push(enc);
-  } catch {}
-
-  // 3) newline-joined key=value fallback
-  try {
-    const nl = Object.entries(req.body)
-      .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
-      .join("\n");
-    if (nl) candidates.push(nl);
-  } catch {}
-
+  const bodies = candidateBodies(req);
   const algs = [WEBHOOK_CHECKSUM_ALG, "sha1", "sha256", "sha384", "sha512"];
-  for (const bodyStr of candidates) {
+
+  for (const bodyStr of bodies) {
     for (const alg of algs) {
       const h = crypto.createHash(alg).update(cb + bodyStr + BBB_SECRET).digest("hex");
       if (constantTimeEquals(h, received)) return true;
     }
   }
+
+  // Debug log on failure (safe: we do NOT log BBB_SECRET)
+  console.warn("WEBHOOK signature mismatch", {
+    cb,
+    received_len: received.length,
+    bodies_tried: bodies.map((b) => b.length),
+    algs_tried: algs,
+    ct: req.headers["content-type"],
+    raw_prefix: (req.rawBody || "").slice(0, 180),
+  });
+
   return !strict;
 }
 
@@ -322,12 +344,65 @@ async function isModeratorStrict({ extMeetingId, intMeetingId }, user) {
   return false;
 }
 
+/* ---------------- Webhook ensure (dedupe + optional prune) ---------------- */
+async function ensureWebhook() {
+  try {
+    const callbackURL = `${BASE}/webhook`;
+
+    // List hooks
+    const listChecksum = crypto.createHash("sha1").update("hooks/list" + "" + BBB_SECRET).digest("hex");
+    const listUrl = `${BBB_API_BASE}/hooks/list?checksum=${listChecksum}`;
+    const listRes = await axios.get(listUrl, { timeout: 10000 });
+    const xmlHooks = xml.parse(listRes.data)?.response?.hooks?.hook;
+    const hooks = xmlHooks ? (Array.isArray(xmlHooks) ? xmlHooks : [xmlHooks]) : [];
+    const exists = hooks.some(h => h?.callbackURL === callbackURL);
+
+    if (!exists) {
+      const params = { callbackURL };
+      const qs = urlEncodeParams(params);
+      const checksum = crypto.createHash("sha1").update("hooks/create" + qs + BBB_SECRET).digest("hex");
+      const url = `${BBB_API_BASE}/hooks/create?${qs}&checksum=${checksum}`;
+      await axios.get(url, { timeout: 10000 });
+      console.log("Registered BBB webhook at", callbackURL);
+    } else {
+      console.log("Webhook already registered:", callbackURL);
+    }
+
+    if (String(WEBHOOK_PRUNE).toLowerCase() === "true") {
+      // Optional: remove any other hooks that do not match our callbackURL
+      for (const h of hooks) {
+        const cb = h?.callbackURL;
+        if (cb && cb !== callbackURL) {
+          try {
+            const params = { hookID: h.hookID || h.id || h["hook-id"] };
+            if (!params.hookID) continue;
+            const qs = urlEncodeParams(params);
+            const checksum = crypto.createHash("sha1").update("hooks/destroy" + qs + BBB_SECRET).digest("hex");
+            const url = `${BBB_API_BASE}/hooks/destroy?${qs}&checksum=${checksum}`;
+            await axios.get(url, { timeout: 10000 });
+            console.log("Pruned old webhook:", cb);
+          } catch (e) {
+            console.warn("Failed to prune webhook:", cb, e?.message);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("ensureWebhook failed:", e?.response?.data || e.message);
+  }
+}
+
 /* ---------------- Routes ---------------- */
 app.get("/healthz", (req, res) => res.json({ ok: true }));
 
 app.post("/webhook", async (req, res) => {
+  // Log something even if signature fails so we know traffic arrived
+  console.log("INCOMING /webhook", { ct: req.headers["content-type"], qkeys: Object.keys(req.query || {}) });
+
   try {
-    if (!verifyWebhookSignature(req)) return res.status(403).send("bad signature");
+    if (!verifyWebhookSignature(req)) {
+      return res.status(403).send("bad signature");
+    }
 
     const events = normalizeWebhookEvents(req);
     console.log("WEBHOOK EVENTS", Array.isArray(events) ? events.length : 0);
@@ -348,7 +423,7 @@ app.post("/webhook", async (req, res) => {
       const text = extractMessage(ev);
       if (!text) continue;
 
-      // Skip Ally's own messages or System echoes of Ally:
+      // Skip Ally/System self-echo
       const uname = (user.name || "").trim().toLowerCase();
       if (uname === (ALLY_NAME || "").toLowerCase()) continue;
       if (uname === "system" && text.trim().startsWith(`${ALLY_NAME}:`)) continue;
@@ -398,36 +473,9 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-/* ---------------- Webhook ensure (dedupe) ---------------- */
-async function ensureWebhook() {
-  try {
-    const callbackURL = `${PUBLIC_BASE_URL}/webhook`;
-
-    // List hooks
-    const listChecksum = crypto.createHash("sha1").update("hooks/list" + "" + BBB_SECRET).digest("hex");
-    const listUrl = `${BBB_API_BASE}/hooks/list?checksum=${listChecksum}`;
-    const listRes = await axios.get(listUrl, { timeout: 10000 });
-    const xmlHooks = xml.parse(listRes.data)?.response?.hooks?.hook;
-    const hooks = xmlHooks ? (Array.isArray(xmlHooks) ? xmlHooks : [xmlHooks]) : [];
-    const exists = hooks.some(h => h?.callbackURL === callbackURL);
-
-    if (!exists) {
-      const params = { callbackURL };
-      const qs = urlEncodeParams(params);
-      const checksum = crypto.createHash("sha1").update("hooks/create" + qs + BBB_SECRET).digest("hex");
-      const url = `${BBB_API_BASE}/hooks/create?${qs}&checksum=${checksum}`;
-      await axios.get(url, { timeout: 10000 });
-      console.log("Registered BBB webhook at", callbackURL);
-    }
-  } catch (e) {
-    console.warn("ensureWebhook failed:", e?.response?.data || e.message);
-  }
-}
-
 /* ---------------- Startup ---------------- */
 app.listen(Number(PORT), async () => {
   console.log(`Ally bot listening on :${PORT}`);
   await ensureWebhook();
-  // Re-ensure every 5 minutes (harmless if already present)
   setInterval(ensureWebhook, 5 * 60 * 1000);
 });
