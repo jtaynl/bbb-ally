@@ -2,11 +2,13 @@
 
 Moderator-only AI chat for **BigBlueButton 3.0** backed by **Alibaba Cloud Model Studio (Qwen)**.
 
-- Trigger: `@ask ally` (moderators only)
+- Trigger: `@ally` (moderators only)
 - Multi-turn via Model Studio `session_id` (stored per meeting+user in Redis)
 - Posts answers back using BBB **sendChatMessage** (auto-chunked to 500 chars)
 - Uses **bbb-webhooks** to receive chat events and verifies signatures
 - Runs as a Docker sidecar (upgrade-safe from BBB perspective)
+- Shows a **typing indicator** (`⏳ Assistant is thinking…`) while waiting for replies
+- Resilient to overflow errors from long context; supports manual reset with phrases like `@ally reset`
 
 ## Quick start
 
@@ -14,6 +16,16 @@ Moderator-only AI chat for **BigBlueButton 3.0** backed by **Alibaba Cloud Model
 - Docker + compose plugin
 - `bbb-webhooks` package installed
 - Nginx available (standard on BBB)
+
+Also configure `/etc/bigbluebutton/bbb-webhooks/production.yml` to ensure checksum-based auth works:
+
+```yaml
+bbb:
+  serverDomain: "YOUR_BBB_HOST"      # host only (no scheme, no path)
+  sharedSecret: "YOUR_BBB_SECRET"    # from bbb-conf --secret
+  auth2_0: false                     # force checksum mode
+  checksumAlgo: sha1                 # default, explicit is fine
+```
 
 ### 1) Clone & configure
 ```bash
@@ -31,6 +43,7 @@ bbb-conf --secret
 
 ### 2) Expose the bot via Nginx
 Add the `nginx-ally.conf` `location /ally/` block to your BBB nginx site (or drop into `/etc/nginx/conf.d/ally.conf`) and reload:
+
 ```bash
 sudo nginx -t && sudo systemctl reload nginx
 ```
@@ -46,9 +59,11 @@ The service auto-registers a webhook to `https://YOUR_BBB_HOST/ally/webhook` eve
 
 ### 4) Test in a meeting
 As a **moderator** in BBB public chat:
+
 ```
-@ask ally What is the difference between TCP and UDP?
+@ally What is the difference between TCP and UDP?
 ```
+
 Ally replies in chat with a multi-turn-capable response.
 
 ## Environment variables
@@ -59,15 +74,23 @@ See `.env.example` for all options. Key ones:
 - `PUBLIC_BASE_URL` — e.g. `https://HOST/ally`
 - `DASHSCOPE_API_KEY` — your Alibaba Cloud DashScope key
 - `APP_ID` — Model Studio Application ID (your Qwen app)
-- `ALLY_TRIGGER` — default `@ask ally`
-- `WEBHOOK_CHECKSUM_ALG` — default `sha1`; the verifier also tries common variants
+- `ALLY_TRIGGER` — default `@ally`
+- `ALLY_NAME` — bot display name in chat
+- `WEBHOOK_CHECKSUM_ALG` — default `sha256`; must match your `production.yml`
 - `WEBHOOK_STRICT` — set `false` temporarily if your signature format differs
+- `ALLY_REQUIRE_MOD` — require moderator role to invoke Ally (default `true`)
+- `DUP_TTL_SECONDS` — dedupe identical asks briefly (default `8`)
+- `QWEN_CONCISE` — `true` to nudge concise answers
+- `ALLY_LOADING_ENABLED` — show loading indicator while waiting
+- `AUTO_RESET_ON_OVERFLOW` — auto-clear session on DashScope overflow errors
+- `ALLY_RESET_PHRASES` — manual reset triggers (default: reset,new topic,clear,…)
 
 ## Notes
+- Configure **bbb-webhooks** with `auth2_0: false` and `checksumAlgo: sha1` or Ally will not receive events.
 - The webhook verifier accepts multiple known encodings; set `WEBHOOK_STRICT=true` for strict checking.
-- For persistence across container restarts, Redis keeps `session_id` for 24h per (meeting,user).
-- No streaming required; completion is posted once ready.
-- Only moderators can invoke via a role check using `getMeetingInfo`.
+- Redis stores Qwen `session_id` per (meeting,user) for 24h; reset clears it.
+- Ally chunks long answers automatically (500 chars per chat message).
+- Only moderators can invoke Ally; enforced via `getMeetingInfo` if needed.
 
 ## License
 MIT
