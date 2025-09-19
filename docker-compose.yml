@@ -1,0 +1,22 @@
+version: "3.8"
+services:
+  ally:
+    build: .
+    image: bbb-ally:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks: [allynet]
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [allynet]
+
+networks:
+  allynet:
+    driver: bridge
